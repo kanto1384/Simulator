@@ -193,3 +193,41 @@ namespace NamedPipeExample
         }
     }
 }
+
+
+using System;
+using System.ServiceModel;
+
+[ServiceContract]
+public interface IRemoteControlServer
+{
+    [OperationContract]
+    string GetServerName(); // 서버 메서드 중 하나: 인자 없는 걸 골라야 테스트에 좋음
+}
+
+class Program
+{
+    static void Main()
+    {
+        var binding = new NetNamedPipeBinding(NetNamedPipeSecurityMode.None);
+        var address = new EndpointAddress("net.pipe://localhost/EIF");
+
+        var factory = new ChannelFactory<IRemoteControlServer>(binding, address);
+        IRemoteControlServer proxy = factory.CreateChannel();
+
+        try
+        {
+            string name = proxy.GetServerName();
+            Console.WriteLine("서버 이름: " + name);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("오류 발생: " + ex.Message);
+        }
+        finally
+        {
+            ((IClientChannel)proxy).Close();
+            factory.Close();
+        }
+    }
+}
