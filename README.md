@@ -129,3 +129,67 @@ namespace EIFClientApp
         }
     }
 }
+
+
+
+
+using System;
+using System.IO;
+using System.IO.Pipes;
+
+namespace NamedPipeExample
+{
+    class NamedPipeClient
+    {
+        static void Main(string[] args)
+        {
+            // 서버에서 지정한 파이프 이름
+            const string pipeName = "testpipe";
+
+            try
+            {
+                using (var client = new NamedPipeClientStream(
+                    serverName: ".",      // 로컬 머신을 가리킵니다. 원격 머신을 사용할 경우 머신 이름으로 변경하세요.
+                    pipeName: pipeName,
+                    direction: PipeDirection.InOut,
+                    options: PipeOptions.None))
+                {
+                    Console.WriteLine($"서버에 연결 시도: {pipeName}...");
+                    client.Connect(5000); // 연결 대기 시간 (ms)
+
+                    Console.WriteLine("서버에 연결되었습니다.");
+
+                    using (var writer = new StreamWriter(client))
+                    using (var reader = new StreamReader(client))
+                    {
+                        writer.AutoFlush = true;
+
+                        // 서버에 메시지 보내기
+                        string messageToServer = "Hello from client!";
+                        Console.WriteLine($"서버로 전송: {messageToServer}");
+                        writer.WriteLine(messageToServer);
+
+                        // 서버로부터 응답 읽기
+                        string response = reader.ReadLine();
+                        Console.WriteLine($"서버 응답: {response}");
+                    }
+                }
+            }
+            catch (TimeoutException)
+            {
+                Console.Error.WriteLine("타임아웃: 서버에 연결할 수 없습니다.");
+            }
+            catch (IOException ex)
+            {
+                Console.Error.WriteLine($"IO 예외 발생: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"예외 발생: {ex}");
+            }
+
+            Console.WriteLine("클라이언트를 종료합니다. 엔터키를 누르세요.");
+            Console.ReadLine();
+        }
+    }
+}
