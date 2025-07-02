@@ -45,3 +45,12 @@ class Program
         }
     }
 }
+
+
+CREATE TABLE TB_CLCTITEM_STND (
+  EQPID        VARCHAR(50)  NOT NULL,
+  CLCTTYPE     VARCHAR(50)  NOT NULL,
+  CLCTITEMNO   INT           NOT NULL,
+  CLCTITEM     VARCHAR(200),
+  FPOINT       INT
+);
