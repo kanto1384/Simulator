@@ -1,56 +1,48 @@
 using System;
-using System.ServiceModel;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 
-[ServiceContract]
-public interface IElementSession {}  // 이건 마커 인터페이스일 가능성 있음
-
-[ServiceContract]
-public interface IElementServer
+// 적당한 네임스페이스/클래스명으로 바꿔서 사용하세요
+public static class PropertyPathHelper
 {
-    [OperationContract]
-    IElementSession Connect(string clientId); // 세션 생성
-
-    [OperationContract]
-    string GetVariableValue(IElementSession session, string tagName); // 세션 기반 요청
-}
-
-class Program
-{
-    static void Main()
+    public static List<string> GetAllPropertyPaths(Type type, int maxDepth = 5)
     {
-        var binding = new NetNamedPipeBinding(NetNamedPipeSecurityMode.None);
-        var address = new EndpointAddress("net.pipe://localhost/EIF");
+        var results = new List<string>();
 
-        var factory = new ChannelFactory<IElementServer>(binding, address);
-        var proxy = factory.CreateChannel();
+        void Recurse(Type currentType, string parentName, int depth)
+        {
+            if (depth > maxDepth) return;
 
-        try
-        {
-            // 1. 세션 연결
-            var session = proxy.Connect("myClient01");
-            Console.WriteLine("세션 연결 성공");
+            foreach (var prop in currentType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                var path = parentName == null
+                    ? prop.Name
+                    : $"{parentName}.{prop.Name}";
+                results.Add(path);
 
-            // 2. 세션 기반 값 요청
-            var value = proxy.GetVariableValue(session, "Pump1.Status");
-            Console.WriteLine($"Pump1 상태: {value}");
+                var pType = prop.PropertyType;
+                if (pType == typeof(string) || pType.IsPrimitive) 
+                    continue;
+
+                if (pType.IsArray)
+                {
+                    Recurse(pType.GetElementType(), path, depth + 1);
+                }
+                else if (typeof(IEnumerable).IsAssignableFrom(pType) && pType.IsGenericType)
+                {
+                    var elemType = pType.GetGenericArguments().First();
+                    Recurse(elemType, path, depth + 1);
+                }
+                else if (pType.IsClass)
+                {
+                    Recurse(pType, path, depth + 1);
+                }
+            }
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine("오류: " + ex.Message);
-        }
-        finally
-        {
-            ((IClientChannel)proxy).Close();
-            factory.Close();
-        }
+
+        Recurse(type, null, 0);
+        return results;
     }
 }
-
-
-CREATE TABLE TB_CLCTITEM_STND (
-  EQPID        VARCHAR(50)  NOT NULL,
-  CLCTTYPE     VARCHAR(50)  NOT NULL,
-  CLCTITEMNO   INT           NOT NULL,
-  CLCTITEM     VARCHAR(200),
-  FPOINT       INT
-);
