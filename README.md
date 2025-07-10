@@ -1,61 +1,96 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
-using System.Linq;
 
-public static class ListDictionaryBuilder
+namespace ExampleApp
 {
-    /// <summary>
-    /// rootType에 선언된 List<T> 멤버들 각각에 대해,
-    /// T의 프로퍼티 이름을 key, 초기값(null)을 value로 갖는 딕셔너리를 만들어
-    /// 멤버 이름→(프로퍼티→값) 딕셔너리 맵을 리턴합니다.
-    /// </summary>
-    public static Dictionary<string, Dictionary<string, object>>
-        Build(Type rootType)
+    // --- 1) 여러분의 모델 클래스들 ---
+    public class C_IN_EQP
     {
-        var result = new Dictionary<string, Dictionary<string, object>>();
-
-        // 1) public 인스턴스 필드/프로퍼티 중에서
-        //    List<T> 타입인 멤버만 골라낸다.
-        var members = rootType
-            .GetMembers(BindingFlags.Public | BindingFlags.Instance)
-            .Where(mi =>
-            {
-                if (mi.MemberType == MemberTypes.Field)
-                    return IsListOfT(((FieldInfo)mi).FieldType);
-                if (mi.MemberType == MemberTypes.Property)
-                    return IsListOfT(((PropertyInfo)mi).PropertyType);
-                return false;
-            });
-
-        foreach (var mi in members)
-        {
-            // 2) 멤버가 Field인지 Property인지 분기해서 List<T> 타입 가져오기
-            Type listType = (mi.MemberType == MemberTypes.Field)
-                ? ((FieldInfo)mi).FieldType
-                : ((PropertyInfo)mi).PropertyType;
-
-            // 3) 그 List<T>의 요소 타입 T
-            Type elemType = listType.GetGenericArguments()[0];
-
-            // 4) T의 public 인스턴스 프로퍼티 이름으로 딕셔너리 초기화
-            var dict = new Dictionary<string, object>();
-            foreach (var pi in elemType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
-            {
-                dict[pi.Name] = null;
-            }
-
-            // 5) 결과 맵에 넣기 (키: “IN_EQP” or “IN_ROLLMAP” 등)
-            result[mi.Name] = dict;
-        }
-
-        return result;
+        public string __EQPTID { get; set; }
+        public string EQPTID   { get; set; }
+        public string __USERID { get; set; }
+        public string USERID   { get; set; }
     }
 
-    // List<T>인지 검사
-    private static bool IsListOfT(Type t)
+    public class C_IN_ROLLMAP
     {
-        return t.IsGenericType
-            && t.GetGenericTypeDefinition() == typeof(List<>);
+        public int    MapId    { get; set; }
+        public string MapName  { get; set; }
+    }
+
+    public class CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN
+    {
+        public List<C_IN_EQP>     IN_EQP     { get; set; }
+        public List<C_IN_ROLLMAP> IN_ROLLMAP { get; set; }
+    }
+
+    // --- 2) 딕셔너리 빌더 유틸리티 ---
+    public static class ListDictionaryBuilder
+    {
+        // 키: 멤버 이름(e.g. "IN_EQP"), 값: 요소 타입의 프로퍼티→값(null) 딕셔너리
+        public static Dictionary<string, Dictionary<string, object>> Build(Type rootType)
+        {
+            var result = new Dictionary<string, Dictionary<string, object>>();
+
+            // rootType의 public 인스턴스 멤버 전부 조사
+            MemberInfo[] members = rootType.GetMembers(BindingFlags.Public | BindingFlags.Instance);
+
+            for (int i = 0; i < members.Length; i++)
+            {
+                MemberInfo mi = members[i];
+                Type memberType;
+
+                // 필드인지 프로퍼티인지 구분
+                if (mi.MemberType == MemberTypes.Field)
+                    memberType = ((FieldInfo)mi).FieldType;
+                else if (mi.MemberType == MemberTypes.Property)
+                    memberType = ((PropertyInfo)mi).PropertyType;
+                else
+                    continue;
+
+                // 제네릭 List<T> 검사
+                if (!memberType.IsGenericType ||
+                    memberType.GetGenericTypeDefinition() != typeof(List<>))
+                    continue;
+
+                // 요소 타입 T 추출
+                Type elementType = memberType.GetGenericArguments()[0];
+
+                // T의 프로퍼티 이름으로 innerDict 초기화
+                var innerDict = new Dictionary<string, object>();
+                PropertyInfo[] props = elementType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                for (int j = 0; j < props.Length; j++)
+                {
+                    innerDict.Add(props[j].Name, null);
+                }
+
+                // 결과에 추가
+                result.Add(mi.Name, innerDict);
+            }
+
+            return result;
+        }
+    }
+
+    // --- 3) 실제 호출부 ---
+    class Program
+    {
+        static void Main()
+        {
+            // 반드시 클래스이름.메서드명 으로 호출합니다.
+            var map = ListDictionaryBuilder.Build(
+                typeof(CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN));
+
+            // 결과 확인
+            foreach (var kv in map)
+            {
+                Console.WriteLine("Member: " + kv.Key);
+                foreach (var inner in kv.Value)
+                {
+                    Console.WriteLine($"  {inner.Key} = {inner.Value}");
+                }
+            }
+        }
     }
 }
