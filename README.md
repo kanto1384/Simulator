@@ -1,48 +1,53 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 
-// 적당한 네임스페이스/클래스명으로 바꿔서 사용하세요
-public static class PropertyPathHelper
+namespace ExampleApp
 {
-    public static List<string> GetAllPropertyPaths(Type type, int maxDepth = 5)
+    // 모델 정의
+    public class A
     {
-        var results = new List<string>();
+        public string ss    { get; set; }
+        public decimal Price{ get; set; }
+        public List<Property> Props { get; set; }
+    }
 
-        void Recurse(Type currentType, string parentName, int depth)
+    public class Property
+    {
+        public string Name { get; set; }
+    }
+
+    public class B
+    {
+        public List<A> BList { get; set; } = new List<A>();
+    }
+
+    class Program
+    {
+        static void Main(string[] args)
         {
-            if (depth > maxDepth) return;
-
-            foreach (var prop in currentType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            // B 인스턴스 생성 및 A 객체 2개 추가
+            var bInstance = new B
             {
-                var path = parentName == null
-                    ? prop.Name
-                    : $"{parentName}.{prop.Name}";
-                results.Add(path);
+                BList = new List<A>
+                {
+                    new A { ss = "first",  Price = 10m, Props = new List<Property>{ new Property{Name="X"} } },
+                    new A { ss = "second", Price = 20m, Props = new List<Property>{ new Property{Name="Y"} } }
+                }
+            };
 
-                var pType = prop.PropertyType;
-                if (pType == typeof(string) || pType.IsPrimitive) 
-                    continue;
+            // BList 프로퍼티에서 요소 타입(A) 추출
+            var listProp    = typeof(B).GetProperty("BList");
+            var elementType = listProp.PropertyType.GetGenericArguments()[0];
 
-                if (pType.IsArray)
-                {
-                    Recurse(pType.GetElementType(), path, depth + 1);
-                }
-                else if (typeof(IEnumerable).IsAssignableFrom(pType) && pType.IsGenericType)
-                {
-                    var elemType = pType.GetGenericArguments().First();
-                    Recurse(elemType, path, depth + 1);
-                }
-                else if (pType.IsClass)
-                {
-                    Recurse(pType, path, depth + 1);
-                }
-            }
+            // A 타입의 public 인스턴스 프로퍼티 이름만 골라 출력
+            var names = elementType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Select(p => p.Name);
+
+            foreach (var name in names)
+                Console.WriteLine(name);
         }
-
-        Recurse(type, null, 0);
-        return results;
     }
 }
