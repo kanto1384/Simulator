@@ -1,38 +1,43 @@
 using System;
-using System.Collections;
-using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-
-// … 여기에 CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN, C_IN_EQP 클래스가 정의되어 있어야 합니다
 
 class Program
 {
     static void Main()
     {
-        // 1) 인스턴스 생성 (필요에 따라 실제 데이터를 채워도 되고, 그냥 타입 정보만 뽑아도 됩니다)
-        var root = new CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN();
+        // 1) 루트 타입
+        var rootType = typeof(CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN);
 
-        // 2) "IN_EQP" 필드(혹은 프로퍼티) 정보 가져오기
-        //    (필드인 경우 GetField, 프로퍼티인 경우 GetProperty)
-        var listField = typeof(CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN)
-                            .GetField("IN_EQP", BindingFlags.Public | BindingFlags.Instance);
-        // var listProp = typeof(...).GetProperty("IN_EQP", ...); // 프로퍼티일 땐 이렇게
+        // 2) "IN_EQP" 멤버(필드 혹은 프로퍼티) 하나로 잡기
+        var member = rootType
+            .GetMember("IN_EQP", BindingFlags.Public | BindingFlags.Instance)
+            .FirstOrDefault();
 
-        // 3) 실제 리스트 객체 꺼내기
-        var list = (IList)listField.GetValue(root);
+        if (member == null)
+            throw new InvalidOperationException("IN_EQP 멤버를 찾을 수 없습니다.");
 
-        // 4) 리스트 요소의 타입 얻기
-        var elementType = listField.FieldType.GetGenericArguments()[0];
+        // 3) 멤버가 Field인지 Property인지 분기해서 리스트 타입 얻기
+        Type listType = member switch
+        {
+            FieldInfo  fi => fi.FieldType,
+            PropertyInfo pi => pi.PropertyType,
+            _ => throw new InvalidOperationException("IN_EQP가 필드도, 프로퍼티도 아닙니다.")
+        };
 
-        // 5) 요소 타입의 public 인스턴스 프로퍼티만 골라내기
-        var props = elementType
-                        .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                        .Select(p => p.Name);
+        // 4) List<T> 의 T 가져오기
+        if (!listType.IsGenericType)
+            throw new InvalidOperationException("IN_EQP가 제네릭 리스트가 아닙니다.");
 
-        // 6) 출력
-        Console.WriteLine($"IN_EQP 요소({elementType.Name}) 의 프로퍼티:");
-        foreach (var name in props)
-            Console.WriteLine(" - " + name);
+        var elementType = listType.GetGenericArguments()[0];
+
+        // 5) 요소 타입의 프로퍼티 이름만 뽑아 출력
+        var names = elementType
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Select(p => p.Name);
+
+        Console.WriteLine($"IN_EQP 요소({elementType.Name}) 프로퍼티:");
+        foreach (var n in names)
+            Console.WriteLine(" - " + n);
     }
 }
