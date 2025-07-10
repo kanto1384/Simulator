@@ -1,53 +1,38 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 
-namespace ExampleApp
+// … 여기에 CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN, C_IN_EQP 클래스가 정의되어 있어야 합니다
+
+class Program
 {
-    // 모델 정의
-    public class A
+    static void Main()
     {
-        public string ss    { get; set; }
-        public decimal Price{ get; set; }
-        public List<Property> Props { get; set; }
-    }
+        // 1) 인스턴스 생성 (필요에 따라 실제 데이터를 채워도 되고, 그냥 타입 정보만 뽑아도 됩니다)
+        var root = new CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN();
 
-    public class Property
-    {
-        public string Name { get; set; }
-    }
+        // 2) "IN_EQP" 필드(혹은 프로퍼티) 정보 가져오기
+        //    (필드인 경우 GetField, 프로퍼티인 경우 GetProperty)
+        var listField = typeof(CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN)
+                            .GetField("IN_EQP", BindingFlags.Public | BindingFlags.Instance);
+        // var listProp = typeof(...).GetProperty("IN_EQP", ...); // 프로퍼티일 땐 이렇게
 
-    public class B
-    {
-        public List<A> BList { get; set; } = new List<A>();
-    }
+        // 3) 실제 리스트 객체 꺼내기
+        var list = (IList)listField.GetValue(root);
 
-    class Program
-    {
-        static void Main(string[] args)
-        {
-            // B 인스턴스 생성 및 A 객체 2개 추가
-            var bInstance = new B
-            {
-                BList = new List<A>
-                {
-                    new A { ss = "first",  Price = 10m, Props = new List<Property>{ new Property{Name="X"} } },
-                    new A { ss = "second", Price = 20m, Props = new List<Property>{ new Property{Name="Y"} } }
-                }
-            };
+        // 4) 리스트 요소의 타입 얻기
+        var elementType = listField.FieldType.GetGenericArguments()[0];
 
-            // BList 프로퍼티에서 요소 타입(A) 추출
-            var listProp    = typeof(B).GetProperty("BList");
-            var elementType = listProp.PropertyType.GetGenericArguments()[0];
+        // 5) 요소 타입의 public 인스턴스 프로퍼티만 골라내기
+        var props = elementType
+                        .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                        .Select(p => p.Name);
 
-            // A 타입의 public 인스턴스 프로퍼티 이름만 골라 출력
-            var names = elementType
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Select(p => p.Name);
-
-            foreach (var name in names)
-                Console.WriteLine(name);
-        }
+        // 6) 출력
+        Console.WriteLine($"IN_EQP 요소({elementType.Name}) 의 프로퍼티:");
+        foreach (var name in props)
+            Console.WriteLine(" - " + name);
     }
 }
