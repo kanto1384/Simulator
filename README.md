@@ -1,43 +1,55 @@
 using System;
-using System.Linq;
 using System.Reflection;
+using System.Collections.Generic;
 
 class Program
 {
     static void Main()
     {
-        // 1) 루트 타입
-        var rootType = typeof(CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN);
+        // 1) 루트 타입 지정
+        Type rootType = typeof(CBR_PRD_REG_AWL_EIF_MARK_DETECT_IN);
 
-        // 2) "IN_EQP" 멤버(필드 혹은 프로퍼티) 하나로 잡기
-        var member = rootType
-            .GetMember("IN_EQP", BindingFlags.Public | BindingFlags.Instance)
-            .FirstOrDefault();
-
-        if (member == null)
-            throw new InvalidOperationException("IN_EQP 멤버를 찾을 수 없습니다.");
-
-        // 3) 멤버가 Field인지 Property인지 분기해서 리스트 타입 얻기
-        Type listType = member switch
+        // 2) "IN_EQP" 필드 또는 프로퍼티 정보 조회
+        MemberInfo[] members = rootType.GetMember("IN_EQP",
+            BindingFlags.Public | BindingFlags.Instance);
+        if (members.Length == 0)
         {
-            FieldInfo  fi => fi.FieldType,
-            PropertyInfo pi => pi.PropertyType,
-            _ => throw new InvalidOperationException("IN_EQP가 필드도, 프로퍼티도 아닙니다.")
-        };
+            Console.WriteLine("IN_EQP 멤버를 찾을 수 없습니다.");
+            return;
+        }
+        MemberInfo member = members[0];
 
-        // 4) List<T> 의 T 가져오기
-        if (!listType.IsGenericType)
-            throw new InvalidOperationException("IN_EQP가 제네릭 리스트가 아닙니다.");
+        // 3) MemberInfo가 Field인지 Property인지 분기하여 List<T> 타입 얻기
+        Type listType;
+        if (member.MemberType == MemberTypes.Field)
+        {
+            listType = ((FieldInfo)member).FieldType;
+        }
+        else if (member.MemberType == MemberTypes.Property)
+        {
+            listType = ((PropertyInfo)member).PropertyType;
+        }
+        else
+        {
+            Console.WriteLine("IN_EQP가 필드도 프로퍼티도 아닙니다.");
+            return;
+        }
 
-        var elementType = listType.GetGenericArguments()[0];
+        // 4) 제네릭 List<> 타입인지, 맞다면 T(요소 타입) 추출
+        if (!listType.IsGenericType || 
+            listType.GetGenericTypeDefinition() != typeof(List<>))
+        {
+            Console.WriteLine("IN_EQP가 제네릭 List<T>가 아닙니다.");
+            return;
+        }
+        Type elementType = listType.GetGenericArguments()[0];
 
-        // 5) 요소 타입의 프로퍼티 이름만 뽑아 출력
-        var names = elementType
-            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Select(p => p.Name);
-
-        Console.WriteLine($"IN_EQP 요소({elementType.Name}) 프로퍼티:");
-        foreach (var n in names)
-            Console.WriteLine(" - " + n);
+        // 5) 요소 타입의 public 인스턴스 프로퍼티 이름만 꺼내서 출력
+        Console.WriteLine("IN_EQP 리스트 요소 타입: " + elementType.Name);
+        foreach (PropertyInfo pi in 
+                 elementType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            Console.WriteLine(" - " + pi.Name);
+        }
     }
 }
