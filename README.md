@@ -23,3 +23,17 @@ for (int row = 2; row <= rowCount; row++) // 헤더 제외
         matchedValues.Add(joined);
     }
 }
+
+
+foreach (var val in matchedValues)
+{
+    var tokens = val.Split('|').Select(x => x.Trim()).ToArray();
+
+    // B~D 총 3개 컬럼이므로 tokens.Length == 3 예상
+    foreach (var token in tokens)
+    {
+        if (token == "O") countO++;
+        else if (token == "X") countX++;
+        else if (string.IsNullOrWhiteSpace(token)) countNull++;
+    }
+}
