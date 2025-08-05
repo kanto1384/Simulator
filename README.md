@@ -24,16 +24,17 @@ for (int row = 2; row <= rowCount; row++) // 헤더 제외
     }
 }
 
-
 foreach (var val in matchedValues)
 {
+    // B~D 열 데이터를 구분자로 나눈 배열
     var tokens = val.Split('|').Select(x => x.Trim()).ToArray();
 
-    // B~D 총 3개 컬럼이므로 tokens.Length == 3 예상
-    foreach (var token in tokens)
-    {
-        if (token == "O") countO++;
-        else if (token == "X") countX++;
-        else if (string.IsNullOrWhiteSpace(token)) countNull++;
-    }
+    bool hasO = tokens.Any(t => t == "O");
+    bool hasX = tokens.Any(t => t == "X");
+
+    if (hasO) countO++;
+    else if (hasX) countX++;
+    else countNull++;
 }
+
+
