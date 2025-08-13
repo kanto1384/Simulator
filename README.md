@@ -1,40 +1,34 @@
-for (int row = 2; row <= rowCount; row++) // 헤더 제외
-{
-    string[] cells = new string[3];
-    bool contains725 = false;
+import pyautogui
+import keyboard
+import time
 
-    for (int col = 2; col <= 4; col++) // B~D = 2~4
-    {
-        var cell = usedRange.Cells[row, col] as Excel.Range;
-        string value = cell?.Text?.ToString() ?? "";
-        cells[col - 2] = value;
+# 트리거 키 설정 (예: F8)
+TRIGGER_KEY = 'F8'
 
-        if (value.Contains("7.2.5"))
-        {
-            contains725 = true;
-        }
+# 더블클릭 후 이동할 Y축 거리 (양수면 아래로, 음수면 위로)
+MOVE_Y = 100
 
-        if (cell != null) Marshal.ReleaseComObject(cell);
-    }
+print(f"[INFO] {TRIGGER_KEY} 키를 누르면 더블클릭 후 Y축 {MOVE_Y} 만큼 이동합니다.")
+print("[INFO] 종료하려면 ESC를 누르세요.")
 
-    if (contains725)
-    {
-        string joined = string.Join(" | ", cells);
-        matchedValues.Add(joined);
-    }
-}
+while True:
+    # ESC로 종료
+    if keyboard.is_pressed('esc'):
+        print("[INFO] 종료합니다.")
+        break
 
-foreach (var val in matchedValues)
-{
-    // B~D 열 데이터를 구분자로 나눈 배열
-    var tokens = val.Split('|').Select(x => x.Trim()).ToArray();
+    # 트리거 키 입력 감지
+    if keyboard.is_pressed(TRIGGER_KEY.lower()):
+        # 현재 마우스 위치 저장
+        x, y = pyautogui.position()
 
-    bool hasO = tokens.Any(t => t == "O");
-    bool hasX = tokens.Any(t => t == "X");
+        # 더블클릭
+        pyautogui.doubleClick(x, y)
+        time.sleep(0.1)
 
-    if (hasO) countO++;
-    else if (hasX) countX++;
-    else countNull++;
-}
+        # 마우스 이동
+        pyautogui.moveTo(x, y + MOVE_Y, duration=0.1)
 
-
+        # 키 떼기 기다림 (중복 실행 방지)
+        while keyboard.is_pressed(TRIGGER_KEY.lower()):
+            time.sleep(0.05)
