@@ -1,34 +1,133 @@
-import pyautogui
-import keyboard
-import time
+// === 하이브리드 매칭: Success는 최신 Start(LIFO), End는 "Success 달린 최신" 우선 ===
+private List<CombinedRow> BuildMergedHybrid(IEnumerable<LogRow> ordered)
+{
+    var result = new List<CombinedRow>();
+    // 변수(BR_별)로 "열린 세션"을 스택처럼 관리하지만, 검색은 선호 규칙으로
+    var open = new Dictionary<string, List<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
 
-# 트리거 키 설정 (예: F8)
-TRIGGER_KEY = 'F8'
+    foreach (var r in ordered)
+    {
+        if (string.IsNullOrEmpty(r.Var) || !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+            continue;
 
-# 더블클릭 후 이동할 Y축 거리 (양수면 아래로, 음수면 위로)
-MOVE_Y = 100
+        if (!open.TryGetValue(r.Var, out var stack))
+        {
+            stack = new List<CombinedRow>();
+            open[r.Var] = stack;
+        }
 
-print(f"[INFO] {TRIGGER_KEY} 키를 누르면 더블클릭 후 Y축 {MOVE_Y} 만큼 이동합니다.")
-print("[INFO] 종료하려면 ESC를 누르세요.")
+        switch (r.Kind)
+        {
+            case ActionKind.Start:
+                stack.Add(new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    Status = "Unknown",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = -1
+                });
+                break;
 
-while True:
-    # ESC로 종료
-    if keyboard.is_pressed('esc'):
-        print("[INFO] 종료합니다.")
-        break
+            case ActionKind.Success:
+            case ActionKind.Fail:
+            {
+                // 뒤에서부터(가장 최근) Success 미부착 세션을 찾는다
+                CombinedRow target = null;
+                for (int i = stack.Count - 1; i >= 0; i--)
+                {
+                    if (!stack[i].SuccessTs.HasValue)
+                    {
+                        target = stack[i];
+                        break;
+                    }
+                }
+                if (target == null && stack.Count > 0)
+                    target = stack[stack.Count - 1]; // 전부 Success가 이미 있다면 마지막에 덮어씀(로그 잡음 방어)
 
-    # 트리거 키 입력 감지
-    if keyboard.is_pressed(TRIGGER_KEY.lower()):
-        # 현재 마우스 위치 저장
-        x, y = pyautogui.position()
+                if (target != null)
+                {
+                    target.SuccessTs = r.Timestamp;
+                    target.Status = (r.Kind == ActionKind.Fail) ? "NG" : "Success";
+                }
+                else
+                {
+                    // 고아 Success → 단독 세션
+                    result.Add(new CombinedRow
+                    {
+                        Var = r.Var,
+                        StartTs = r.Timestamp,
+                        SuccessTs = r.Timestamp,
+                        Status = (r.Kind == ActionKind.Fail) ? "NG" : "Success",
+                        SourceFile = r.SourceFile,
+                        StartIdx = (int)r.LineIndex,
+                        EndIdx = -1
+                    });
+                }
+                break;
+            }
 
-        # 더블클릭
-        pyautogui.doubleClick(x, y)
-        time.sleep(0.1)
+            case ActionKind.End:
+            {
+                // 1순위: Success가 이미 있는 가장 최근 세션
+                CombinedRow target = null;
+                for (int i = stack.Count - 1; i >= 0; i--)
+                {
+                    if (stack[i].SuccessTs.HasValue) { target = stack[i]; break; }
+                }
+                // 2순위: 그냥 가장 최근 세션
+                if (target == null && stack.Count > 0)
+                    target = stack[stack.Count - 1];
 
-        # 마우스 이동
-        pyautogui.moveTo(x, y + MOVE_Y, duration=0.1)
+                if (target != null)
+                {
+                    target.EndTs = r.Timestamp;
+                    target.EndIdx = (int)r.LineIndex;
+                    target.DurationSeconds = Math.Max(0, Math.Round((target.EndTs.Value - target.StartTs).TotalSeconds, 3));
+                    if (target.Status == "Unknown" && target.SuccessTs.HasValue) target.Status = "Success";
+                    result.Add(target);
+                    stack.Remove(target);
+                }
+                else
+                {
+                    // 고아 End → 0초 세션
+                    result.Add(new CombinedRow
+                    {
+                        Var = r.Var,
+                        StartTs = r.Timestamp,
+                        EndTs = r.Timestamp,
+                        Status = "Unknown",
+                        SourceFile = r.SourceFile,
+                        StartIdx = (int)r.LineIndex,
+                        EndIdx = (int)r.LineIndex,
+                        DurationSeconds = 0
+                    });
+                }
+                break;
+            }
+        }
+    }
 
-        # 키 떼기 기다림 (중복 실행 방지)
-        while keyboard.is_pressed(TRIGGER_KEY.lower()):
-            time.sleep(0.05)
+    // 파일 끝에서 아직 열린 세션 정리
+    foreach (var kv in open)
+    {
+        foreach (var cur in kv.Value)
+        {
+            if (!cur.EndTs.HasValue)
+            {
+                cur.EndTs = cur.SuccessTs ?? cur.StartTs;
+                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+            }
+            if (cur.Status == "Unknown" && cur.SuccessTs.HasValue) cur.Status = "Success";
+            result.Add(cur);
+        }
+    }
+
+    return result.OrderBy(x => x.StartTs).ToList();
+}
+
+
+
+
+mergedRows = BuildMergedHybrid(forMerged.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex));
