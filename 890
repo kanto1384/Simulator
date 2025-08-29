@@ -1,0 +1,109 @@
+// Success 헤더라인 인덱스 → LOT 값(파일별 맵)
+private readonly Dictionary<string, Dictionary<int, string>> lotIndexByFile =
+    new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
+
+// LOT 매칭용 정규식 (한 줄 매칭)
+private static readonly Regex rxOutLot = new Regex(@"^\s*\[\s*0\s*:\s*OUT_LOTID\s*\]\s*:\s*(.+)\s*$",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+private static readonly Regex rxInLot  = new Regex(@"^\s*\[\s*0\s*:\s*INPUT_LOTID\s*\]\s*:\s*(.+)\s*$",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+
+    public int SuccessIdx { get; set; } = -1;
+public string MLot { get; set; }
+
+private string ExtractLotLine(string blockText)
+{
+    using (var reader = new StringReader(blockText))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            var mOut = rxOutLot.Match(line);
+            if (mOut.Success) return mOut.Groups[1].Value.Trim();
+
+            var mIn = rxInLot.Match(line);
+            if (mIn.Success) return mIn.Groups[1].Value.Trim();
+        }
+    }
+    return string.Empty;
+}
+
+private void BuildLotIndexForFile(string fullPath)
+{
+    var source = Path.GetFileName(fullPath);
+    var map = new Dictionary<int, string>();
+    int currentHeaderIdx = -1;
+    bool inSuccessBlock = false;
+    var sbBlock = new StringBuilder(1024);
+    long idx = 0;
+
+    using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
+    {
+        string line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            var m = headRx.Match(line);
+            if (m.Success)
+            {
+                // 이전 Success 블록 flush
+                if (inSuccessBlock && currentHeaderIdx >= 0)
+                {
+                    var lot = ExtractLotLine(sbBlock.ToString());
+                    if (!string.IsNullOrEmpty(lot)) map[currentHeaderIdx] = lot;
+                }
+
+                // 새 헤더 시작
+                currentHeaderIdx = (int)idx;
+                sbBlock.Clear();
+                inSuccessBlock = (DetectKind(m.Groups["rest"].Value) == ActionKind.Success);
+            }
+            else
+            {
+                if (inSuccessBlock) sbBlock.AppendLine(line);
+            }
+            idx++;
+        }
+    }
+
+    // 파일 끝에서도 한 번 더 flush
+    if (inSuccessBlock && currentHeaderIdx >= 0)
+    {
+        var lot = ExtractLotLine(sbBlock.ToString());
+        if (!string.IsNullOrEmpty(lot)) map[currentHeaderIdx] = lot;
+    }
+
+    lock (locker) { lotIndexByFile[source] = map; }
+}
+
+
+
+private async Task LoadOneFileAsync(string file)
+{
+    SetBusy("파일 읽는 중…", true);
+    try
+    {
+        lock (locker) { rows.Clear(); lotIndexByFile.Clear(); } // ★ 이전 인덱스 초기화
+        await Task.Run(async () => { await ParseFileAsync(file); });
+
+        // ★ 여기! LOT 인덱스 1회 빌드 (UI 프리징 없음)
+        await Task.Run(() => BuildLotIndexForFile(file));
+
+        ApplyFilterAndBind();
+        statusLabel.Text = $"완료: {Path.GetFileName(file)}  라인 {rows.Count}";
+    }
+    catch (Exception ex)
+    {
+        statusLabel.Text = "오류 발생";
+        MessageBox.Show(ex.ToString(), "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+    finally
+    {
+        SetBusy(statusLabel.Text, false);
+    }
+}
+
+
+
+
