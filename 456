@@ -87,3 +87,212 @@ var mLot = new DataGridViewTextBoxColumn {
 
 // AddRange에 mLot 포함:
 gridMerged.Columns.AddRange(new DataGridViewColumn[] { mStart, mVar, mStatus, mEnd, mDur, mLot });
+
+
+
+
+
+// 파일별: Success 헤더 인덱스 → LOT 문자열
+private readonly Dictionary<string, Dictionary<int, string>> lotIndexByFile =
+    new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
+
+// 미리 컴파일된 정규식
+private static readonly Regex rxOutLot = new Regex(@"\[\s*0\s*:\s*OUT_LOTID\s*\]\s*:\s*(.+)$",
+    RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
+private static readonly Regex rxInLot  = new Regex(@"\[\s*0\s*:\s*INPUT_LOTID\s*\]\s*:\s*(.+)$",
+    RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
+
+
+
+
+
+// 파일을 한 번만 훑어서: Success 헤더 라인 인덱스 → LOT 값을 수집
+private void BuildLotIndexForFile(string fullPath)
+{
+    var source = Path.GetFileName(fullPath);
+    var map = new Dictionary<int, string>(); // SuccessIdx -> LOT
+    int currentHeaderIdx = -1;
+    ActionKind currentKind = ActionKind.Other;
+
+    using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
+    {
+        string line;
+        long idx = 0;
+
+        // 한 헤더 블록 내에서 LOT 발견하면 true
+        bool inSuccessBlock = false;
+        var sbBlock = new StringBuilder(1024);
+
+        while ((line = sr.ReadLine()) != null)
+        {
+            var m = headRx.Match(line);
+            if (m.Success)
+            {
+                // 이전 블록이 Success였다면, LOT 추출해서 map에 기록
+                if (inSuccessBlock && currentHeaderIdx >= 0)
+                {
+                    string txt = sbBlock.ToString();
+                    string lot = "";
+                    var mOut = rxOutLot.Match(txt);
+                    if (mOut.Success) lot = mOut.Groups[1].Value.Trim();
+                    else
+                    {
+                        var mIn = rxInLot.Match(txt);
+                        if (mIn.Success) lot = mIn.Groups[1].Value.Trim();
+                    }
+                    if (!string.IsNullOrEmpty(lot))
+                        map[currentHeaderIdx] = lot;
+                }
+
+                // 새 헤더 진입
+                currentHeaderIdx = (int)idx;
+                sbBlock.Clear();
+                inSuccessBlock = false;
+                currentKind = DetectKind(m.Groups["rest"].Value);
+
+                if (currentKind == ActionKind.Success) inSuccessBlock = true;
+
+                idx++;
+                continue;
+            }
+
+            // 헤더가 아니면: 현재 블록 내용에 누적
+            if (inSuccessBlock) sbBlock.AppendLine(line);
+            idx++;
+        }
+
+        // 파일 끝에서도 한 번 더 마무리
+        if (inSuccessBlock && currentHeaderIdx >= 0)
+        {
+            string txt = sbBlock.ToString();
+            string lot = "";
+            var mOut = rxOutLot.Match(txt);
+            if (mOut.Success) lot = mOut.Groups[1].Value.Trim();
+            else
+            {
+                var mIn = rxInLot.Match(txt);
+                if (mIn.Success) lot = mIn.Groups[1].Value.Trim();
+            }
+            if (!string.IsNullOrEmpty(lot))
+                map[currentHeaderIdx] = lot;
+        }
+    }
+
+    lock (locker)
+    {
+        lotIndexByFile[source] = map; // 파일명(key)로 저장
+    }
+}
+
+
+
+
+private async Task LoadOneFileAsync(string file)
+{
+    SetBusy("파일 읽는 중…", true);
+    try
+    {
+        lock (locker) { rows.Clear(); }
+        await Task.Run(async () => { await ParseFileAsync(file); });
+
+        // ★ LOT 인덱스는 파일당 1회 스캔 (고속, UI 프리징 없음)
+        await Task.Run(() => BuildLotIndexForFile(file));
+
+        ApplyFilterAndBind();
+        statusLabel.Text = $"완료: {Path.GetFileName(file)}  라인 {rows.Count}";
+    }
+    catch (Exception ex)
+    {
+        statusLabel.Text = "오류 발생";
+        MessageBox.Show(ex.ToString(), "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+    finally
+    {
+        SetBusy(statusLabel.Text, false);
+    }
+}
+
+
+
+
+else if (r.Kind == ActionKind.Success || r.Kind == ActionKind.Fail)
+{
+    if (q.Count > 0)
+    {
+        var cur = q.Peek();
+        cur.SuccessTs  = r.Timestamp;
+        cur.Status     = (r.Kind == ActionKind.Fail) ? "NG" : "Success";
+        cur.SuccessIdx = (int)r.LineIndex; // ★ 저장만
+    }
+    else
+    {
+        var orphan = new CombinedRow
+        {
+            Var = r.Var,
+            StartTs = r.Timestamp,
+            SuccessTs = r.Timestamp,
+            Status = (r.Kind == ActionKind.Fail) ? "NG" : "Success",
+            SourceFile = r.SourceFile,
+            StartIdx = (int)r.LineIndex,
+            EndIdx = -1,
+            SuccessIdx = (int)r.LineIndex
+        };
+
+        // ★ 고아 Success도 딕셔너리 조회
+        if (lotIndexByFile.TryGetValue(orphan.SourceFile, out var map))
+        {
+            if (map.TryGetValue(orphan.SuccessIdx, out var lot))
+                orphan.MLot = lot;
+        }
+        result.Add(orphan);
+    }
+}
+else if (r.Kind == ActionKind.End)
+{
+    if (q.Count > 0)
+    {
+        var cur = q.Dequeue();
+        cur.EndTs = r.Timestamp;
+        cur.EndIdx = (int)r.LineIndex;
+        cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+        if (cur.Status == "Unknown" && cur.SuccessTs.HasValue) cur.Status = "Success";
+
+        // ★ LOT은 여기서 한 번만 딕셔너리 조회
+        if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
+        {
+            if (lotIndexByFile.TryGetValue(cur.SourceFile, out var map))
+            {
+                if (map.TryGetValue(cur.SuccessIdx, out var lot))
+                    cur.MLot = lot;
+            }
+        }
+
+        result.Add(cur);
+    }
+    else
+    {
+        // 고아 End
+        result.Add(new CombinedRow
+        {
+            Var = r.Var,
+            StartTs = r.Timestamp,
+            EndTs = r.Timestamp,
+            Status = "Unknown",
+            SourceFile = r.SourceFile,
+            StartIdx = (int)r.LineIndex,
+            EndIdx = (int)r.LineIndex,
+            DurationSeconds = 0
+        });
+    }
+}
+
+
+var mLot = new DataGridViewTextBoxColumn {
+    Name = "colLot",
+    HeaderText = "LOT",
+    DataPropertyName = "MLot",
+    Width = 200,
+    SortMode = DataGridViewColumnSortMode.Programmatic
+};
+// AddRange(...)에 포함
