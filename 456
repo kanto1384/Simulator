@@ -1,0 +1,89 @@
+public class CombinedRow
+{
+    public string Var { get; set; }
+    public DateTime StartTs { get; set; }
+    public DateTime? SuccessTs { get; set; }
+    public DateTime? EndTs { get; set; }
+    public string Status { get; set; }
+    public double? DurationSeconds { get; set; }
+    public string SourceFile { get; set; }
+    public int StartIdx { get; set; }
+    public int EndIdx { get; set; }
+
+    // ★ 추가
+    public int SuccessIdx { get; set; } = -1;   // Success 헤더라인 인덱스
+    public string MLot { get; set; }            // 그리드에 표시할 LOT ID
+}
+
+private string ExtractLotFromSuccessBlock(string sourceFile, int successHeaderIdx)
+{
+    if (successHeaderIdx < 0) return string.Empty;
+
+    // Success 헤더부터 다음 헤더 전까지 텍스트 블록
+    string block = ReadBlock(sourceFile, successHeaderIdx);
+    if (string.IsNullOrEmpty(block)) return string.Empty;
+
+    // [0:OUT_LOTID] : Qasw  또는  [0:INPUT_LOTID] : Abc123
+    // 값은 공백 포함 없이 한 줄 끝까지 캡쳐 (필요하면 \S+ 대신 .+? 로 바꿀 수 있음)
+    var rxOut = new Regex(@"\[\s*0\s*:\s*OUT_LOTID\s*\]\s*:\s*(.+)$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+    var rxIn  = new Regex(@"\[\s*0\s*:\s*INPUT_LOTID\s*\]\s*:\s*(.+)$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+
+    var mOut = rxOut.Match(block);
+    if (mOut.Success)
+        return mOut.Groups[1].Value.Trim();
+
+    var mIn = rxIn.Match(block);
+    if (mIn.Success)
+        return mIn.Groups[1].Value.Trim();
+
+    return string.Empty; // 둘 다 없으면 공백
+}
+
+
+
+else if (r.Kind == ActionKind.Success || r.Kind == ActionKind.Fail)
+{
+    if (q.Count > 0)
+    {
+        var cur = q.Peek(); // 맨 앞 세션에 부착 (FIFO)
+        cur.SuccessTs  = r.Timestamp;
+        cur.Status     = (r.Kind == ActionKind.Fail) ? "NG" : "Success";
+        cur.SuccessIdx = (int)r.LineIndex; // ★ 기록
+
+        // ★ 여기서 바로 LOT 추출 시도 (성능상 걱정되면 End에서 한 번만 해도 됨)
+        var lot = ExtractLotFromSuccessBlock(cur.SourceFile, cur.SuccessIdx);
+        if (!string.IsNullOrEmpty(lot))
+            cur.MLot = lot;
+    }
+    else
+    {
+        // 고아 Success → 참고용 세션
+        var orphan = new CombinedRow
+        {
+            Var = r.Var,
+            StartTs = r.Timestamp,
+            SuccessTs = r.Timestamp,
+            Status = (r.Kind == ActionKind.Fail) ? "NG" : "Success",
+            SourceFile = r.SourceFile,
+            StartIdx = (int)r.LineIndex,
+            EndIdx = -1,
+            SuccessIdx = (int)r.LineIndex
+        };
+        orphan.MLot = ExtractLotFromSuccessBlock(orphan.SourceFile, orphan.SuccessIdx);
+        result.Add(orphan);
+    }
+}
+
+
+
+// 컬럼 생성시
+var mLot = new DataGridViewTextBoxColumn {
+    Name = "colLot",
+    HeaderText = "mLot",
+    DataPropertyName = "MLot",   // ★ 이 이름이 CombinedRow.MLot과 같아야 함
+    Width = 200,
+    SortMode = DataGridViewColumnSortMode.Programmatic
+};
+
+// AddRange에 mLot 포함:
+gridMerged.Columns.AddRange(new DataGridViewColumn[] { mStart, mVar, mStatus, mEnd, mDur, mLot });
