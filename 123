@@ -29,3 +29,37 @@ txtSearchVar.KeyDown += (s, e) =>
         btnSearch.PerformClick();
     }
 };
+
+
+
+private void ApplyFilterAndBind()
+{
+    IEnumerable<LogRow> q = rows;
+
+    if (chkBROnly.Checked)
+        q = q.Where(r => (r.Var ?? string.Empty).StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
+
+    // 기존:
+    // var s = (txtSearchVar.Text ?? "").Trim();
+    // if (!string.IsNullOrEmpty(s))
+    //     q = q.Where(r => (r.Var ?? "").IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0);
+
+    // 변경: '|' OR 검색 지원
+    q = FilterBySearch(q);
+
+    viewRows = q.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex).ToList();
+    BindLines(viewRows);
+
+    var forMerged = rows.AsEnumerable();
+    if (chkBROnly.Checked)
+        forMerged = forMerged.Where(r => (r.Var ?? "").StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
+
+    // 결합쪽도 동일하게 OR 검색 적용
+    forMerged = FilterBySearch(forMerged);
+
+    mergedRows = BuildMergedQueue(forMerged.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex));
+    bsMerged.DataSource = mergedRows;
+    gridMerged.DataSource = bsMerged;
+
+    ToggleMode();
+}
