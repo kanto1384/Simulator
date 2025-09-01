@@ -1,0 +1,43 @@
+// 클래스 필드(한 번만 선언). 인덱스는 \d+ 로, 값은 .* 로(빈 문자열도 캡처)
+private static readonly Regex rxOutLot = new Regex(
+    @"^\s*\[\s*\d+\s*:\s*OUT_LOTID\s*\]\s*:\s*(.*)\s*$",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+private static readonly Regex rxInLot = new Regex(
+    @"^\s*\[\s*\d+\s*:\s*INPUT_LOTID\s*\]\s*:\s*(.*)\s*$",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Success 블록에서 LOT 한 줄만 추출 (우선순위: OUT(비어있지 않음) → INPUT(비어있지 않음) → "" )
+private string ExtractLotLine(string blockText)
+{
+    string bestOut = null; // OUT 중 "비어있지 않은" 마지막 값
+    string bestIn  = null; // INPUT 중 "비어있지 않은" 마지막 값
+
+    using (var reader = new StringReader(blockText))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            var mOut = rxOutLot.Match(line);
+            if (mOut.Success)
+            {
+                var val = (mOut.Groups[1].Value ?? "").Trim();
+                if (!string.IsNullOrEmpty(val))
+                    bestOut = val;          // 비어있지 않은 OUT → 후보 갱신
+                continue; // 같은 줄에 INPUT도 있을 일은 없지만 안전하게 continue
+            }
+
+            var mIn = rxInLot.Match(line);
+            if (mIn.Success)
+            {
+                var val = (mIn.Groups[1].Value ?? "").Trim();
+                if (!string.IsNullOrEmpty(val))
+                    bestIn = val;           // 비어있지 않은 INPUT → 후보 갱신
+            }
+        }
+    }
+
+    if (!string.IsNullOrEmpty(bestOut)) return bestOut; // OUT 우선
+    if (!string.IsNullOrEmpty(bestIn))  return bestIn;  // OUT이 비었을 때 INPUT
+    return string.Empty;                                 // 둘 다 없거나 둘 다 공백
+}
