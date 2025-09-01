@@ -1,0 +1,73 @@
+private static readonly Regex rxOutLot = ...
+private static readonly Regex rxInLot = ...
+private string ExtractLotLine(string blockText) { ... }
+
+// 비즈명별 LOT 우선순위 규칙
+private static readonly Dictionary<string, string[]> lotKeyRules =
+    new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+{
+    { "BR_Slit",   new [] { "OUT_LOTID", "INPUT_LOTID" } },
+    { "BR_Align",  new [] { "INPUT_CSTID" } },
+    { "BR_Other",  new [] { "OUT_LOTID" } },
+    // 필요한 비즈마다 계속 추가
+};
+
+// Success 블록에서 LOT 값 추출 (비즈별 규칙 적용)
+private string ExtractLotByBiz(string varName, string blockText)
+{
+    var found = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    using (var reader = new StringReader(blockText))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            // [0:OUT_LOTID] : 값   → key = OUT_LOTID, val = 값
+            var m = Regex.Match(line, @"^\s*\[\s*\d+\s*:\s*(\w+)\s*\]\s*:\s*(.*)\s*$");
+            if (m.Success)
+            {
+                string key = m.Groups[1].Value.Trim();
+                string val = (m.Groups[2].Value ?? "").Trim();
+                if (!found.ContainsKey(key))
+                    found[key] = val;
+            }
+        }
+    }
+
+    // 비즈별 규칙 적용
+    if (lotKeyRules.TryGetValue(varName, out var keys))
+    {
+        foreach (var key in keys)
+        {
+            if (found.TryGetValue(key, out var val) && !string.IsNullOrEmpty(val))
+                return val;
+        }
+    }
+
+    return string.Empty;
+}
+
+
+var lot = ExtractLotLine(sbBlock.ToString());
+
+var lot = ExtractLotByBiz(currentVarName, sbBlock.ToString());
+
+
+string currentVarName = null;
+
+if (m.Success)
+{
+    // 헤더 라인 안에서 Var 추출
+    currentVarName = m.Groups["var"].Value; // headRx 패턴에 Var 캡처 그룹 추가해야 함
+    ...
+}
+
+
+
+
+
+
+
+
+
+
