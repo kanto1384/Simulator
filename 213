@@ -1,0 +1,62 @@
+// 클래스 필드(한 번만 선언)
+private static readonly Regex rxOutLot = new Regex(
+    @"^\s*\[\s*0\s*:\s*OUT_LOTID\s*\]\s*:\s*(.*)\s*$",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+private static readonly Regex rxInLot  = new Regex(
+    @"^\s*\[\s*0\s*:\s*INPUT_LOTID\s*\]\s*:\s*(.*)\s*$",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Success 블록에서 LOT 한 줄만 추출 (우선순위: OUT → (OUT이 공백이면) INPUT → 없으면 "")
+private string ExtractLotLine(string blockText)
+{
+    string outVal = null;
+    string inVal  = null;
+
+    using (var reader = new StringReader(blockText))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            if (outVal == null)
+            {
+                var mOut = rxOutLot.Match(line);
+                if (mOut.Success) outVal = (mOut.Groups[1].Value ?? "").Trim();
+            }
+
+            if (inVal == null)
+            {
+                var mIn = rxInLot.Match(line);
+                if (mIn.Success) inVal = (mIn.Groups[1].Value ?? "").Trim();
+            }
+
+            if (outVal != null && inVal != null) break; // 둘 다 찾았으면 종료
+        }
+    }
+
+    // 우선순위 적용
+    if (!string.IsNullOrEmpty(outVal)) return outVal; // OUT이 있고 값이 비어있지 않으면 OUT
+    if (outVal != null && string.IsNullOrEmpty(outVal) && !string.IsNullOrEmpty(inVal))
+        return inVal; // OUT 줄은 있었는데 값이 공백이면 INPUT 사용
+    if (!string.IsNullOrEmpty(inVal)) return inVal;   // OUT 없고 INPUT만 있으면 INPUT
+    return string.Empty; // 둘 다 없거나 둘 다 공백이면 공백
+}
+
+// BuildLotIndexForFile(...) 내부 Success 블록 flush 시점
+var lot = ExtractLotLine(sbBlock.ToString());
+// 값이 빈 문자열일 수도 있으므로, 그대로 저장할지 말지는 선택.
+// 보통은 빈 문자열이면 저장 안 하고, 조회 시 기본 공백으로 남겨도 무방.
+if (!string.IsNullOrEmpty(lot))
+    map[currentHeaderIdx] = lot;
+
+// 만약 "OUT/INPUT 줄이 있었지만 공백"도 표시하고 싶다면:
+// map[currentHeaderIdx] = lot;  // 빈 문자열도 저장
+
+// End 분기에서
+if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
+{
+    if (lotIndexByFile.TryGetValue(cur.SourceFile, out var map))
+        if (map.TryGetValue(cur.SuccessIdx, out var lot))
+            cur.MLot = lot;  // lot가 ""일 수도 있음 (규칙대로)
+}
+
