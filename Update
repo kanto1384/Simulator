@@ -1,0 +1,344 @@
+좋아, “검색창에 BR_... 를 치면 LOT 옆에 해당 비즈만의 추가 필드(PV/SV/ID 등) 컬럼이 자동으로 생기고, 검색을 바꾸거나 초기화하면 컬럼이 사라지도록” 만들자.
+핵심은 성공 블록에서 모든 Key:Value를 1회 스캔해 인덱스화하고, 그리드의 동적 컬럼을 검색어에 맞춰 붙였다 떼는 거야. LOT은 그대로 유지하고, 옆에 동적 컬럼을 꽂아 넣자.
+
+아래 패치를 그대로 넣으면 돼. (이전 LOT 전용 인덱스는 걷어내고, “성공블록 Key-Value 인덱스”로 교체)
+
+
+---
+
+1) 클래스 필드 추가
+
+// 성공 블록의 Key:Value 인덱스 (파일 → Success헤더Idx → {키→값})
+private readonly Dictionary<string, Dictionary<int, Dictionary<string, string>>> kvIndexByFile
+    = new Dictionary<string, Dictionary<int, Dictionary<string, string>>>(StringComparer.OrdinalIgnoreCase);
+
+// 현재 동적 컬럼 목록(제거/교체용)
+private readonly List<string> currentDynamicCols = new List<string>();
+
+// 비즈별 추가 표시 키 규칙 (원하는 대로 편집)
+private static readonly Dictionary<string, string[]> extraKeyRules =
+    new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+{
+    // 예시
+    { "BR_1", new[] { "PV" } },                  // LOT + PV
+    { "BR_2", new[] { "SV", "ID" } },            // LOT + SV, ID
+    // 여기에 계속 추가/수정
+};
+
+// 기본 LOT 우선순위(이전과 동일 개념: 규칙 없는 비즈일 때 LOT 뽑는 용도)
+private static readonly string[] defaultLotKeys = new[] { "OUT_LOTID", "INPUT_LOTID", "INPUT_CSTID" };
+
+
+---
+
+2) “성공 블록 Key:Value 인덱스” 빌드 (파일 1회 스캔)
+
+이 함수가 기존 BuildLotIndexForFile 을 대체한다.
+
+// 헤더 'rest'에서 Var 추출(기존 파서와 동일 규칙)
+private string GetVarFromHeader(string sourceFile, string rest)
+{
+    var tokens = new List<string>();
+    string tmp = rest ?? "";
+    int guard = 0;
+    while (guard++ < 8)
+    {
+        var m = bracketRx.Match(tmp); // ^\[(?<tok>[^\]]+)\]\s*
+        if (!m.Success) break;
+        tokens.Add(m.Groups["tok"].Value);
+        tmp = tmp.Substring(m.Length);
+    }
+
+    string device = null, varName = null;
+    if (tokens.Count >= 2) { device = tokens[0]; varName = tokens[1]; }
+    else if (tokens.Count == 1) { varName = tokens[0]; }
+
+    if (string.IsNullOrEmpty(device))
+    {
+        var n = Path.GetFileNameWithoutExtension(sourceFile);
+        var cut = n.LastIndexOf('_');
+        device = cut > 0 ? n.Substring(0, cut) : n;
+    }
+    if (string.IsNullOrEmpty(varName)) varName = device ?? "GLOBAL";
+    return varName;
+}
+
+// Success 블록에서 모든 Key:Value를 수집
+private Dictionary<string, string> ParseSuccessBlockPairs(string blockText)
+{
+    var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    using (var reader = new StringReader(blockText ?? ""))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            // [n:KEY] : VALUE  → KEY, VALUE
+            var m = Regex.Match(line, @"^\s*\[\s*\d+\s*:\s*([A-Za-z0-9_]+)\s*\]\s*:\s*(.*)\s*$");
+            if (!m.Success) continue;
+            var key = m.Groups[1].Value.Trim();
+            var val = (m.Groups[2].Value ?? "").Trim();
+            // 여러 번 나오면 마지막 값으로 갱신 (원하면 최초만 유지해도 됨)
+            dict[key] = val;
+        }
+    }
+    return dict;
+}
+
+// Success 블록에서 LOT을 비즈 규칙/기본 우선순위로 도출 (pairs는 그 블록의 모든 키-값)
+private string PickLotFromPairs(string varName, Dictionary<string, string> pairs)
+{
+    if (pairs == null || pairs.Count == 0) return string.Empty;
+
+    if (!string.IsNullOrEmpty(varName) && extraKeyRules.TryGetValue(varName, out var _))
+    {
+        // LOT은 고정으로 ‘OUT_LOTID → INPUT_LOTID → INPUT_CSTID’ 같은 기본키로 추출 (원하면 비즈별로 따로도 가능)
+    }
+
+    foreach (var k in defaultLotKeys)
+        if (pairs.TryGetValue(k, out var v) && !string.IsNullOrEmpty(v)) return v;
+
+    return string.Empty;
+}
+
+// 파일 1회 스캔으로: Success 헤더Idx → (Key→Value) 인덱스 생성 + LOT(Mlot)도 여기서 구해쓰기 쉬움
+private void BuildSuccessKVIndexForFile(string fullPath)
+{
+    var source = Path.GetFileName(fullPath);
+    var map = new Dictionary<int, Dictionary<string, string>>(); // SuccessIdx → pairs
+
+    long idx = 0;
+    int currentHeaderIdx = -1;
+    bool inSuccessBlock = false;
+    var sbBlock = new StringBuilder(1024);
+    string currentVarName = null;
+
+    using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
+    {
+        string line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            var m = headRx.Match(line); // ^(?<dt>...) \[(?<level>...)\] (?<rest>.*)$
+            if (m.Success)
+            {
+                // 이전 Success 블록을 마감하며 인덱스 생성
+                if (inSuccessBlock && currentHeaderIdx >= 0)
+                {
+                    var pairs = ParseSuccessBlockPairs(sbBlock.ToString());
+                    map[currentHeaderIdx] = pairs; // 값이 비어있어도 저장(조회 시 공백이면 빈칸)
+                }
+
+                // 새 헤더 준비
+                currentHeaderIdx = (int)idx;
+                sbBlock.Clear();
+                var rest = m.Groups["rest"].Value;
+                inSuccessBlock = (DetectKind(rest) == ActionKind.Success);
+                currentVarName = GetVarFromHeader(source, rest);
+            }
+            else
+            {
+                if (inSuccessBlock) sbBlock.AppendLine(line);
+            }
+            idx++;
+        }
+    }
+
+    // 파일 끝에서 마지막 Success 블록 flush
+    if (inSuccessBlock && currentHeaderIdx >= 0)
+    {
+        var pairs = ParseSuccessBlockPairs(sbBlock.ToString());
+        map[currentHeaderIdx] = pairs;
+    }
+
+    lock (locker)
+    {
+        kvIndexByFile[source] = map;
+    }
+}
+
+
+---
+
+3) 파일 로드시 인덱스 빌드 호출
+
+LoadOneFileAsync(string file) 안을 이렇게:
+
+private async Task LoadOneFileAsync(string file)
+{
+    SetBusy("파일 읽는 중…", true);
+    try
+    {
+        lock (locker) { rows.Clear(); kvIndexByFile.Clear(); } // ★ 이전 인덱스 초기화
+        await Task.Run(async () => { await ParseFileAsync(file); });
+
+        // ★ 성공 블록 Key:Value 인덱스 1회 빌드 (프리징 방지)
+        await Task.Run(() => BuildSuccessKVIndexForFile(file));
+
+        ApplyFilterAndBind();
+        statusLabel.Text = $"완료: {Path.GetFileName(file)}  라인 {rows.Count}";
+    }
+    catch (Exception ex)
+    {
+        statusLabel.Text = "오류 발생";
+        MessageBox.Show(ex.ToString(), "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+    finally
+    {
+        SetBusy(statusLabel.Text, false);
+    }
+}
+
+
+---
+
+4) 세션(CombinedRow)에서 LOT 채우기만 보강
+
+(End에서 한 번만 조회) — 기존 FIFO 매칭 함수 내 End 분기:
+
+// End 분기 내부 (q.Dequeue() 이후)
+if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
+{
+    if (kvIndexByFile.TryGetValue(cur.SourceFile, out var fileMap) &&
+        fileMap.TryGetValue(cur.SuccessIdx, out var pairs))
+    {
+        cur.MLot = PickLotFromPairs(cur.Var, pairs);
+    }
+}
+
+> Success 때는 cur.SuccessIdx = (int)r.LineIndex; 만 저장해두면 됨.
+
+
+
+
+---
+
+5) 동적 컬럼 추가/제거 (검색어에 따라)
+
+LOT 컬럼은 고정(이미 있음).
+
+검색창에 BR_... 를 넣었을 때만 추가 컬럼을 LOT 오른쪽에 붙인다.
+
+검색 변경/초기화 시 기존 동적 컬럼 제거.
+
+
+// 검색창 내용으로 동적 컬럼 갱신
+private void UpdateDynamicColumnsForSearch()
+{
+    // 1) 기존 동적 컬럼 제거
+    foreach (var name in currentDynamicCols.ToList())
+    {
+        if (gridMerged.Columns.Contains(name))
+            gridMerged.Columns.Remove(name);
+    }
+    currentDynamicCols.Clear();
+
+    // 2) 검색어에서 첫 번째 BR_* 토큰을 추출 (A|B|C 지원)
+    var raw = (txtSearchVar.Text ?? "").Trim();
+    if (string.IsNullOrEmpty(raw)) { gridMerged.Refresh(); return; }
+
+    var tokens = raw.Split('|')
+                    .Select(s => s.Trim())
+                    .Where(s => s.Length > 0)
+                    .ToArray();
+
+    var biz = tokens.FirstOrDefault(t => t.StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
+    if (string.IsNullOrEmpty(biz)) { gridMerged.Refresh(); return; }
+
+    // 3) 비즈별 추가 키 규칙 조회
+    if (!extraKeyRules.TryGetValue(biz, out var keys) || keys == null || keys.Length == 0)
+    {
+        gridMerged.Refresh();
+        return;
+    }
+
+    // 4) LOT 옆에 동적 컬럼 삽입
+    int lotIdx = gridMerged.Columns.Cast<DataGridViewColumn>()
+                     .FirstOrDefault(c => c.DataPropertyName == "MLot")?.Index ?? -1;
+    int insertAt = (lotIdx >= 0) ? lotIdx + 1 : gridMerged.Columns.Count;
+
+    foreach (var key in keys)
+    {
+        var colName = $"colExtra_{key}";
+        if (gridMerged.Columns.Contains(colName)) continue;
+
+        var col = new DataGridViewTextBoxColumn
+        {
+            Name = colName,
+            HeaderText = key,           // 헤더에 키 이름 그대로 노출
+            Width = 160,
+            SortMode = DataGridViewColumnSortMode.Programmatic,
+            Tag = key                   // CellFormatting에서 사용할 실제 키
+        };
+        gridMerged.Columns.Insert(insertAt++, col);
+        currentDynamicCols.Add(colName);
+    }
+
+    gridMerged.Refresh();
+}
+
+이 함수를 검색 버튼/초기화 버튼/ApplyFilterAndBind 이후에 호출:
+
+btnSearch.Click += (s, e) => { ApplyFilterAndBind(); UpdateDynamicColumnsForSearch(); };
+btnClear.Click  += (s, e) => { txtSearchVar.Text = ""; ApplyFilterAndBind(); UpdateDynamicColumnsForSearch(); };
+// 검색창에서 Enter 처리하는 코드가 있다면, 그 곳에서도 UpdateDynamicColumnsForSearch() 호출
+
+
+---
+
+6) 동적 컬럼 값 넣기 (CellFormatting)
+
+동적 컬럼은 DataPropertyName이 없으니, CellFormatting에서 값 채워준다.
+
+private void gridMerged_CellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
+{
+    if (e.RowIndex < 0) return;
+    var col = gridMerged.Columns[e.ColumnIndex];
+    if (col == null || !col.Name.StartsWith("colExtra_", StringComparison.Ordinal)) return;
+
+    var row = gridMerged.Rows[e.RowIndex].DataBoundItem as CombinedRow;
+    if (row == null || row.SuccessIdx < 0) { e.Value = ""; e.FormattingApplied = true; return; }
+
+    // 성공 블록 Key:Value 조회
+    if (!kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) ||
+        !fileMap.TryGetValue(row.SuccessIdx, out var pairs) ||
+        pairs == null) { e.Value = ""; e.FormattingApplied = true; return; }
+
+    var key = (col.Tag as string) ?? col.HeaderText; // 규칙에서 지정한 키
+    if (pairs.TryGetValue(key, out var val) && !string.IsNullOrEmpty(val))
+    {
+        e.Value = val;
+    }
+    else
+    {
+        e.Value = ""; // 없으면 공백
+    }
+    e.FormattingApplied = true;
+}
+
+> 생성자에서 한 번만 구독:
+
+
+
+gridMerged.CellFormatting += gridMerged_CellFormatting;
+
+
+---
+
+동작 요약
+
+파일 로드 시 성공 블록을 1회 스캔해서 Key:Value 전부 인덱싱 → 빠름, 프리징 최소화
+
+LOT은 기존처럼 표시(End에서 한 번만 채움)
+
+검색창에 BR_1 → extraKeyRules["BR_1"](예: PV)만큼 LOT 옆에 동적 컬럼 생성
+
+BR_2로 검색 바꾸면 기존 동적 컬럼 제거 → SV, ID 컬럼으로 교체
+
+검색 초기화/다른 키워드 → 동적 컬럼 제거
+
+값은 CellFormatting에서 현재 행의 SourceFile + SuccessIdx로 인덱스를 조회해 즉시 채움
+
+
+원하는 비즈/키 매핑은 extraKeyRules 딕셔너리만 수정하면 된다.
+예시로 몇 개만 넣어놨으니 실제 비즈명과 키 이름 알려주면 내가 그 자리에서 표 채워줄게.
+
