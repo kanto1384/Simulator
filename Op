@@ -1,0 +1,472 @@
+좋아! 지금까지 붙여온 성공블록 KV 인덱스 + 동적 컬럼 + LOT + 정렬을 한 번에 정리해서,
+
+**“키의 최대 인덱스 0~n 자동 감지 → 그 개수만큼 컬럼 생성”**까지 포함한 업데이트 패치를 줄게.
+
+아래 순서대로 넣으면 돼. (기존에 내가 준 동일 이름 함수/필드는 교체)
+
+
+
+1) 필드/정적 정의 (클래스 상단)
+
+
+// ==== 인덱스 저장소 ====
+// 파일 → Success헤더Idx → (키 → (인덱스 → 값))
+private readonly Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<int, string>>>> kvIndexByFile
+    = new Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<int, string>>>>(StringComparer.OrdinalIgnoreCase);
+
+// 현재 동적 컬럼 이름들 (삭제용)
+private readonly List<string> currentDynamicCols = new List<string>();
+
+// 비즈별 추가 표시 키(LOT은 고정으로 따로 처리, 여긴 LOT 옆에 붙일 컬럼들)
+private static readonly Dictionary<string, string[]> extraKeyRules =
+    new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+{
+    // 예시(원하는대로 채워넣으세요)
+    { "BR_1", new[] { "PV" } },           // LOT + PV[0..n]
+    { "BR_2", new[] { "SV", "ID" } },     // LOT + SV[0..n], ID[0..n]
+    // ...
+};
+
+// LOT 후보키(기본 우선순위) — 비즈별로 따로 하고 싶으면 PickLotFromPairs에서 분기
+private static readonly string[] defaultLotKeys = new[] { "OUT_LOTID", "INPUT_LOTID", "INPUT_CSTID" };
+
+// 정렬 상태
+private string _mergedLastSortCol = null;
+private bool _mergedLastSortAsc = true;
+
+
+
+
+2) 헤더에서 Var 추출(유틸) — 그대로/교체
+
+
+// [..][..] 토큰에서 Var(두번째 토큰) 추출
+private string GetVarFromHeader(string sourceFile, string rest)
+{
+    var tokens = new List<string>();
+    string tmp = rest ?? "";
+    int guard = 0;
+    while (guard++ < 8)
+    {
+        var m = bracketRx.Match(tmp); // ^\[(?<tok>[^\]]+)\]\s*
+        if (!m.Success) break;
+        tokens.Add(m.Groups["tok"].Value);
+        tmp = tmp.Substring(m.Length);
+    }
+
+    string device = null, varName = null;
+    if (tokens.Count >= 2) { device = tokens[0]; varName = tokens[1]; }
+    else if (tokens.Count == 1) { varName = tokens[0]; }
+
+    if (string.IsNullOrEmpty(device))
+    {
+        var n = Path.GetFileNameWithoutExtension(sourceFile);
+        var cut = n.LastIndexOf('_');
+        device = cut > 0 ? n.Substring(0, cut) : n;
+    }
+    if (string.IsNullOrEmpty(varName)) varName = device ?? "GLOBAL";
+    return varName;
+}
+
+
+
+
+3) 성공블록 파서(인덱스 보존) — 교체
+
+
+// Success 블록에서 모든 [idx:KEY] : VALUE 수집 → KEY → (idx → value)
+private Dictionary<string, Dictionary<int, string>> ParseSuccessBlockPairsWithIndex(string blockText)
+{
+    var dict = new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
+    using (var reader = new StringReader(blockText ?? ""))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            var m = Regex.Match(line, @"^\s*\[\s*(\d+)\s*:\s*([A-Za-z0-9_]+)\s*\]\s*:\s*(.*)\s*$");
+            if (!m.Success) continue;
+
+            int idx = int.Parse(m.Groups[1].Value);
+            string key = m.Groups[2].Value.Trim();
+            string val = (m.Groups[3].Value ?? "").Trim();
+
+            if (!dict.TryGetValue(key, out var byIndex))
+            {
+                byIndex = new Dictionary<int, string>();
+                dict[key] = byIndex;
+            }
+            byIndex[idx] = val; // 같은 인덱스가 여러 번 나오면 "마지막 값"으로 갱신
+        }
+    }
+    return dict;
+}
+
+
+
+
+4) 파일 1회 스캔으로 KV 인덱스 생성 — 교체
+
+
+private void BuildSuccessKVIndexForFile(string fullPath)
+{
+    var source = Path.GetFileName(fullPath);
+    var map = new Dictionary<int, Dictionary<string, Dictionary<int, string>>>(); // SuccessIdx → key→(idx→val)
+
+    long idx = 0;
+    int currentHeaderIdx = -1;
+    bool inSuccessBlock = false;
+    var sbBlock = new StringBuilder(1024);
+    string currentVarName = null;
+
+    using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
+    {
+        string line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            var m = headRx.Match(line); // ^(?<dt>...) \[(?<level>...)\] (?<rest>.*)$
+            if (m.Success)
+            {
+                // 이전 Success 블록 flush
+                if (inSuccessBlock && currentHeaderIdx >= 0)
+                {
+                    var pairs = ParseSuccessBlockPairsWithIndex(sbBlock.ToString());
+                    map[currentHeaderIdx] = pairs; // 비어있어도 저장
+                }
+
+                // 새 헤더 준비
+                currentHeaderIdx = (int)idx;
+                sbBlock.Clear();
+                var rest = m.Groups["rest"].Value;
+                inSuccessBlock = (DetectKind(rest) == ActionKind.Success);
+                currentVarName = GetVarFromHeader(source, rest);
+            }
+            else
+            {
+                if (inSuccessBlock) sbBlock.AppendLine(line);
+            }
+            idx++;
+        }
+    }
+
+    // 파일 끝에서도 flush
+    if (inSuccessBlock && currentHeaderIdx >= 0)
+    {
+        var pairs = ParseSuccessBlockPairsWithIndex(sbBlock.ToString());
+        map[currentHeaderIdx] = pairs;
+    }
+
+    lock (locker) { kvIndexByFile[source] = map; }
+}
+
+
+
+
+
+파일 로드 흐름에서:
+
+
+lock (locker) { rows.Clear(); kvIndexByFile.Clear(); }
+await Task.Run(async () => { await ParseFileAsync(file); });
+await Task.Run(() => BuildSuccessKVIndexForFile(file));  // ★ 반드시 호출
+ApplyFilterAndBind();
+UpdateDynamicColumnsForSearch(); // ★ 검색어에 맞춰 동적컬럼 갱신
+
+
+
+
+
+
+5) LOT 채우기 (세션 닫힐 때 1회) — 교체
+
+
+// LOT 후보키에서 0..n 중 첫 비어있지 않은 값 선택
+private string PickLotFromPairs(string varName, Dictionary<string, Dictionary<int, string>> pairs)
+{
+    if (pairs == null || pairs.Count == 0) return string.Empty;
+
+    // (원하면 varName별 LOT 후보키 우선순위 분기 가능)
+    foreach (var k in defaultLotKeys)
+    {
+        if (!pairs.TryGetValue(k, out var byIndex) || byIndex == null || byIndex.Count == 0)
+            continue;
+
+        int maxIdx = byIndex.Keys.Count > 0 ? byIndex.Keys.Max() : -1;
+        for (int i = 0; i <= maxIdx; i++)
+        {
+            if (byIndex.TryGetValue(i, out var v) && !string.IsNullOrWhiteSpace(v))
+                return v.Trim();
+        }
+    }
+    return string.Empty;
+}
+
+
+
+BuildMergedQueue의 End 분기에서:
+
+
+// LOT은 여기서 한 번만 조회
+if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
+{
+    if (kvIndexByFile.TryGetValue(cur.SourceFile, out var fileMap) &&
+        fileMap.TryGetValue(cur.SuccessIdx, out var pairs))
+    {
+        cur.MLot = PickLotFromPairs(cur.Var, pairs);
+    }
+}
+
+
+
+
+6) 동적 컬럼: 키의 최대 인덱스 0..n 감지 → 컬럼 생성
+
+
+private void UpdateDynamicColumnsForSearch()
+{
+    // 1) 기존 동적 컬럼 제거
+    foreach (var name in currentDynamicCols.ToList())
+        if (gridMerged.Columns.Contains(name)) gridMerged.Columns.Remove(name);
+    currentDynamicCols.Clear();
+
+    // 2) 검색어에서 첫 번째 BR_* 추출
+    var raw = (txtSearchVar.Text ?? "").Trim();
+    if (string.IsNullOrEmpty(raw)) { gridMerged.Refresh(); return; }
+    var tokens = raw.Split('|').Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
+    var biz = tokens.FirstOrDefault(t => t.StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
+    if (string.IsNullOrEmpty(biz)) { gridMerged.Refresh(); return; }
+
+    // 3) 비즈별 추가 키 룰
+    if (!extraKeyRules.TryGetValue(biz, out var keys) || keys == null || keys.Length == 0)
+    { gridMerged.Refresh(); return; }
+
+    // 4) 각 키마다 "현재 표시중인 mergedRows" 에서 최대 인덱스 계산
+    var maxIndexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    foreach (var key in keys)
+    {
+        int maxIdx = -1;
+        foreach (var r in mergedRows)
+        {
+            if (r.SuccessIdx < 0) continue;
+            if (!kvIndexByFile.TryGetValue(r.SourceFile, out var fileMap)) continue;
+            if (!fileMap.TryGetValue(r.SuccessIdx, out var pairs)) continue;
+            if (!pairs.TryGetValue(key, out var byIndex) || byIndex == null || byIndex.Count == 0) continue;
+
+            int localMax = byIndex.Keys.Max();
+            if (localMax > maxIdx) maxIdx = localMax;
+        }
+        if (maxIdx >= 0) maxIndexByKey[key] = maxIdx;
+    }
+
+    if (maxIndexByKey.Count == 0) { gridMerged.Refresh(); return; }
+
+    // 5) LOT 옆에 삽입
+    int lotIdx = gridMerged.Columns.Cast<DataGridViewColumn>()
+                    .FirstOrDefault(c => c.DataPropertyName == "MLot")?.Index ?? -1;
+    int insertAt = (lotIdx >= 0) ? lotIdx + 1 : gridMerged.Columns.Count;
+
+    // 6) 키마다 0..maxIdx 컬럼 생성
+    foreach (var kv in maxIndexByKey)
+    {
+        string key = kv.Key;
+        int maxIdx = kv.Value;
+        for (int i = 0; i <= maxIdx; i++)
+        {
+            string colName = $"colExtra_{key}_{i}";
+            if (gridMerged.Columns.Contains(colName)) continue;
+
+            var col = new DataGridViewTextBoxColumn
+            {
+                Name = colName,
+                HeaderText = $"{key}[{i}]",
+                Width = 140,
+                SortMode = DataGridViewColumnSortMode.Programmatic,
+                Tag = (key, i) // CellFormatting/정렬에서 사용
+            };
+            gridMerged.Columns.Insert(insertAt++, col);
+            currentDynamicCols.Add(colName);
+        }
+    }
+
+    gridMerged.Refresh();
+}
+
+
+
+
+
+호출 위치: ApplyFilterAndBind() 끝, btnSearch/초기화/검색창 Enter 처리 후에도 UpdateDynamicColumnsForSearch() 호출.
+
+
+
+
+
+7) 동적 컬럼 값 채우기 (CellFormatting) — 교체/추가
+
+
+private void gridMerged_CellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
+{
+    if (e.RowIndex < 0) return;
+    var col = gridMerged.Columns[e.ColumnIndex];
+    if (col == null) return;
+
+    // 동적 컬럼만 처리
+    if (!col.Name.StartsWith("colExtra_", StringComparison.Ordinal)) return;
+
+    var row = gridMerged.Rows[e.RowIndex].DataBoundItem as CombinedRow;
+    if (row == null || row.SuccessIdx < 0) { e.Value = ""; e.FormattingApplied = true; return; }
+
+    if (!kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) ||
+        !fileMap.TryGetValue(row.SuccessIdx, out var pairs) ||
+        pairs == null) { e.Value = ""; e.FormattingApplied = true; return; }
+
+    (string key, int idx) = ((string, int))col.Tag;
+    if (pairs.TryGetValue(key, out var byIndex) &&
+        byIndex != null &&
+        byIndex.TryGetValue(idx, out var val) &&
+        !string.IsNullOrEmpty(val))
+    {
+        e.Value = val;
+    }
+    else e.Value = "";
+
+    e.FormattingApplied = true;
+}
+
+
+
+
+
+한 번만 구독:
+
+gridMerged.CellFormatting += gridMerged_CellFormatting;
+
+
+
+
+
+8) LOT/동적 컬럼 헤더 클릭 정렬 — 추가
+
+
+private string GetMergedCellSortKey(CombinedRow row, DataGridViewColumn col)
+{
+    if (row == null || col == null) return string.Empty;
+
+    // LOT
+    if (col.DataPropertyName == "MLot" || col.Name.Equals("colLot", StringComparison.OrdinalIgnoreCase))
+        return row.MLot ?? string.Empty;
+
+    // 동적
+    if (col.Name.StartsWith("colExtra_", StringComparison.Ordinal))
+    {
+        if (!kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) ||
+            !fileMap.TryGetValue(row.SuccessIdx, out var pairs) ||
+            pairs == null) return string.Empty;
+
+        (string key, int idx) = ((string, int))col.Tag;
+        if (pairs.TryGetValue(key, out var byIndex) &&
+            byIndex != null &&
+            byIndex.TryGetValue(idx, out var val))
+            return val ?? string.Empty;
+
+        return string.Empty;
+    }
+
+    // 기본: DataPropertyName 문자열
+    var dp = col.DataPropertyName;
+    if (!string.IsNullOrEmpty(dp))
+    {
+        var prop = typeof(CombinedRow).GetProperty(dp);
+        if (prop != null)
+        {
+            var v = prop.GetValue(row);
+            return v?.ToString() ?? string.Empty;
+        }
+    }
+    return string.Empty;
+}
+
+private void gridMerged_ColumnHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
+{
+    if (e.ColumnIndex < 0 || e.ColumnIndex >= gridMerged.Columns.Count) return;
+    var col = gridMerged.Columns[e.ColumnIndex];
+
+    bool asc = true;
+    if (string.Equals(_mergedLastSortCol, col.Name, StringComparison.Ordinal))
+        asc = !_mergedLastSortAsc;
+    _mergedLastSortCol = col.Name;
+    _mergedLastSortAsc = asc;
+
+    Func<CombinedRow, string> keySel = r => GetMergedCellSortKey(r, col);
+
+    IOrderedEnumerable<CombinedRow> ordered;
+    if (asc)
+        ordered = mergedRows.OrderBy(keySel, StringComparer.OrdinalIgnoreCase).ThenBy(r => r.StartTs);
+    else
+        ordered = mergedRows.OrderByDescending(keySel, StringComparer.OrdinalIgnoreCase).ThenByDescending(r => r.StartTs);
+
+    mergedRows = ordered.ToList();
+    bsMerged.DataSource = null;
+    bsMerged.DataSource = mergedRows;
+    gridMerged.DataSource = bsMerged;
+}
+
+
+
+
+
+구독: gridMerged.ColumnHeaderMouseClick += gridMerged_ColumnHeaderMouseClick;
+
+LOT/동적 컬럼의 SortMode = Programmatic 확인.
+
+
+
+
+
+9) 바인딩 후 호출 위치(중요)
+
+
+private void ApplyFilterAndBind()
+{
+    // ... 기존 필터/바인딩 로직 ...
+    bsMerged.DataSource = mergedRows;
+    gridMerged.DataSource = bsMerged;
+
+    // ★ 검색어/현재 데이터에 맞춰 동적컬럼 생성
+    UpdateDynamicColumnsForSearch();
+}
+
+
+
+
+이렇게 되면
+
+
+
+
+성공블록에서 [0:KEY] ~ [n:KEY] 를 모두 인덱싱 →
+
+검색창에 BR_… 입력 시, 해당 비즈의 extraKeyRules에 있는 각 KEY의 최대 인덱스 n을 자동 탐지해서
+
+KEY[0]..KEY[n] 컬럼을 LOT 옆에 생성해줌.
+
+
+값은 CellFormatting에서 빠르게 채워짐(O(1) 조회).
+
+
+LOT은 기존대로 End에서 1회 조회/채움(빠름).
+
+
+헤더 클릭 정렬이 LOT/동적 컬럼에도 정상 동작.
+
+
+검색어 변경/초기화 시 동적 컬럼 싹 제거 후 재생성.
+
+
+
+
+필요하면 extraKeyRules만 네 환경에 맞게 채워줘.
+
+더 원하는 포맷(예: KEY[0] 숨기고 1..n만 표시, 폭 자동 맞춤 등) 있으면 이어서 손볼게.
+
+
