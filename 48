@@ -76,3 +76,62 @@ private void ApplyFilters()
     bs.Filter = c.Count > 0 ? string.Join(" AND ", c.ToArray()) : null;
     bs.ResetBindings(false);
 }
+
+
+
+
+
+
+
+
+
+private void ShowFilterMenu(int col)
+{
+    // 0) DataSource 존재 가드
+    if (grid.DataSource == null) return;
+    BindingSource _bs = grid.DataSource as BindingSource;
+    if (_bs == null || _bs.DataSource == null) return;
+
+    // 1) 컬럼 키 구하기 (DataPropertyName 우선, 없으면 Name)
+    string n = grid.Columns[col].DataPropertyName;
+    if (string.IsNullOrEmpty(n)) n = grid.Columns[col].Name;
+    if (string.IsNullOrEmpty(n)) return;
+
+    // 2) DataTable 안전 획득 (DataView일 수도 있으니 보완)
+    DataTable dt = _bs.DataSource as DataTable;
+    if (dt == null)
+    {
+        DataView dv = _bs.DataSource as DataView;
+        if (dv != null) dt = dv.Table;
+    }
+    if (dt == null) return;                    // 여전히 없으면 중단
+    if (!dt.Columns.Contains(n)) return;       // 컬럼 미존재 가드
+
+    // 3) Distinct 값 만들기 (DBNull/Null 안전)
+    var vals = dt.AsEnumerable()
+                 .Select(r => r.IsNull(n) ? "(null)" : Convert.ToString(r[n]))
+                 .Where(s => s != null) // Convert.ToString이 null이면 제거
+                 .Distinct()
+                 .ToList();
+
+    // 4) 메뉴 구성
+    ContextMenuStrip m = new ContextMenuStrip();
+    m.Items.Add("Clear Filter", null, (s, e) => { activeFilters.Remove(n); ApplyFilters(); });
+    m.Items.Add(new ToolStripSeparator());
+
+    foreach (string v in vals)
+    {
+        ToolStripMenuItem i = new ToolStripMenuItem(v);
+        i.Checked = activeFilters.ContainsKey(n) && activeFilters[n].Contains(v);
+        i.Click += (s, e) =>
+        {
+            if (!activeFilters.ContainsKey(n)) activeFilters[n] = new List<string>();
+            if (i.Checked) activeFilters[n].Remove(v);
+            else activeFilters[n].Add(v);
+            ApplyFilters();
+        };
+        m.Items.Add(i);
+    }
+
+    m.Show(grid, grid.PointToClient(Cursor.Position));
+}
