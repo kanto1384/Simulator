@@ -1,0 +1,78 @@
+BindingSource bs = new BindingSource();
+Dictionary<string, List<string>> activeFilters = new Dictionary<string, List<string>>();
+
+public YourFormConstructorOrInitMethod()
+{
+    bs.DataSource = grid.DataSource; grid.DataSource = bs;
+    grid.CellPainting += Dgv_CellPainting;
+    grid.MouseDown += Dgv_MouseDown;
+}
+
+private void Dgv_CellPainting(object sender, DataGridViewCellPaintingEventArgs e)
+{
+    if (e.RowIndex == -1 && e.ColumnIndex >= 0)
+    {
+        e.PaintBackground(e.ClipBounds, false);
+        e.PaintContent(e.ClipBounds);
+        int btn = 14;
+        Rectangle r = new Rectangle(e.CellBounds.Right - btn - 4, e.CellBounds.Top + (e.CellBounds.Height - btn) / 2, btn, btn);
+        ControlPaint.DrawButton(e.Graphics, r, ButtonState.Flat);
+        e.Graphics.DrawString("▼", grid.Font, Brushes.Black, r);
+        e.Handled = true;
+    }
+}
+
+private void Dgv_MouseDown(object sender, MouseEventArgs e)
+{
+    var h = grid.HitTest(e.X, e.Y);
+    if (e.Button == MouseButtons.Left && h.RowIndex == -1 && h.ColumnIndex >= 0)
+    {
+        Rectangle r = grid.GetCellDisplayRectangle(h.ColumnIndex, -1, true);
+        r.Width -= 4;
+        r.X += r.Width - 18;
+        if (r.Contains(e.Location))
+        {
+            ShowFilterMenu(h.ColumnIndex);
+        }
+    }
+}
+
+private void ShowFilterMenu(int col)
+{
+    ContextMenuStrip m = new ContextMenuStrip();
+    string n = grid.Columns[col].DataPropertyName;
+    DataTable dt = ((BindingSource)grid.DataSource).DataSource as DataTable;
+    var vals = dt.AsEnumerable().Select(r => r[n].ToString()).Distinct().ToList();
+
+    m.Items.Add("Clear Filter", null, (s, e) => { activeFilters.Remove(n); ApplyFilters(); });
+    m.Items.Add(new ToolStripSeparator());
+
+    foreach (string v in vals)
+    {
+        ToolStripMenuItem i = new ToolStripMenuItem(v);
+        i.Checked = activeFilters.ContainsKey(n) && activeFilters[n].Contains(v);
+        i.Click += (s, e) =>
+        {
+            if (!activeFilters.ContainsKey(n)) activeFilters[n] = new List<string>();
+            if (i.Checked) activeFilters[n].Remove(v); else activeFilters[n].Add(v);
+            ApplyFilters();
+        };
+        m.Items.Add(i);
+    }
+    m.Show(grid, grid.PointToClient(Cursor.Position));
+}
+
+private void ApplyFilters()
+{
+    List<string> c = new List<string>();
+    foreach (var kv in activeFilters)
+    {
+        if (kv.Value.Count > 0)
+        {
+            string list = string.Join(",", kv.Value.ConvertAll(v => "'" + v + "'"));
+            c.Add("[" + kv.Key + "] IN (" + list + ")");
+        }
+    }
+    bs.Filter = c.Count > 0 ? string.Join(" AND ", c.ToArray()) : null;
+    bs.ResetBindings(false);
+}
