@@ -131,3 +131,27 @@ private List<CombinedRow> BuildMergedHybrid(IEnumerable<LogRow> ordered)
 
 
 mergedRows = BuildMergedHybrid(forMerged.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex));
+
+
+
+
+using System.Text.RegularExpressions;
+
+public static bool HasMissingAmpersand(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    string s = text.Replace(" ", "");
+
+    // ① [정상블록][정상블록]이 그대로 붙어있는 경우
+    //    예: "B:1000:10W:100A:10"
+    //
+    // ② 주소 안에 새 디바이스 블록이 끼어든 경우
+    //    예: "W:100B:100:2"  (원래는 "W:1000&B:100:2" 여야 함)
+    const string pattern = 
+        @"(?:[A-Za-z]{1,3}:[0-9A-Fa-f]+:\d+(?=[A-Za-z]{1,3}:[0-9A-Fa-f]+:\d+))" // ①
+        + @"|(?:[0-9A-Fa-f]+[A-Za-z]{1,3}:\d+:\d+)";                           // ②
+
+    return Regex.IsMatch(s, pattern);
+}
