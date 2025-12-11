@@ -155,3 +155,18 @@ public static bool HasMissingAmpersand(string text)
 
     return Regex.IsMatch(s, pattern);
 }
+
+
+public static bool IsValidMemorySpec(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    string s = text.Replace(" ", "");
+
+    // TYPE:숫자:숫자 (&TYPE:숫자:숫자)* 전체 형식
+    const string pattern =
+        @"^(?:[A-Za-z]{1,3}:\d+:\d+)(?:&[A-Za-z]{1,3}:\d+:\d+)*$";
+
+    return Regex.IsMatch(s, pattern);
+}
