@@ -1,217 +1,86 @@
-// === 하이브리드 매칭: Success는 최신 Start(LIFO), End는 "Success 달린 최신" 우선 ===
-private List<CombinedRow> BuildMergedHybrid(IEnumerable<LogRow> ordered)
-{
-    var result = new List<CombinedRow>();
-    // 변수(BR_별)로 "열린 세션"을 스택처럼 관리하지만, 검색은 선호 규칙으로
-    var open = new Dictionary<string, List<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
-
-    foreach (var r in ordered)
-    {
-        if (string.IsNullOrEmpty(r.Var) || !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
-            continue;
-
-        if (!open.TryGetValue(r.Var, out var stack))
-        {
-            stack = new List<CombinedRow>();
-            open[r.Var] = stack;
-        }
-
-        switch (r.Kind)
-        {
-            case ActionKind.Start:
-                stack.Add(new CombinedRow
-                {
-                    Var = r.Var,
-                    StartTs = r.Timestamp,
-                    Status = "Unknown",
-                    SourceFile = r.SourceFile,
-                    StartIdx = (int)r.LineIndex,
-                    EndIdx = -1
-                });
-                break;
-
-            case ActionKind.Success:
-            case ActionKind.Fail:
-            {
-                // 뒤에서부터(가장 최근) Success 미부착 세션을 찾는다
-                CombinedRow target = null;
-                for (int i = stack.Count - 1; i >= 0; i--)
-                {
-                    if (!stack[i].SuccessTs.HasValue)
-                    {
-                        target = stack[i];
-                        break;
-                    }
-                }
-                if (target == null && stack.Count > 0)
-                    target = stack[stack.Count - 1]; // 전부 Success가 이미 있다면 마지막에 덮어씀(로그 잡음 방어)
-
-                if (target != null)
-                {
-                    target.SuccessTs = r.Timestamp;
-                    target.Status = (r.Kind == ActionKind.Fail) ? "NG" : "Success";
-                }
-                else
-                {
-                    // 고아 Success → 단독 세션
-                    result.Add(new CombinedRow
-                    {
-                        Var = r.Var,
-                        StartTs = r.Timestamp,
-                        SuccessTs = r.Timestamp,
-                        Status = (r.Kind == ActionKind.Fail) ? "NG" : "Success",
-                        SourceFile = r.SourceFile,
-                        StartIdx = (int)r.LineIndex,
-                        EndIdx = -1
-                    });
-                }
-                break;
-            }
-
-            case ActionKind.End:
-            {
-                // 1순위: Success가 이미 있는 가장 최근 세션
-                CombinedRow target = null;
-                for (int i = stack.Count - 1; i >= 0; i--)
-                {
-                    if (stack[i].SuccessTs.HasValue) { target = stack[i]; break; }
-                }
-                // 2순위: 그냥 가장 최근 세션
-                if (target == null && stack.Count > 0)
-                    target = stack[stack.Count - 1];
-
-                if (target != null)
-                {
-                    target.EndTs = r.Timestamp;
-                    target.EndIdx = (int)r.LineIndex;
-                    target.DurationSeconds = Math.Max(0, Math.Round((target.EndTs.Value - target.StartTs).TotalSeconds, 3));
-                    if (target.Status == "Unknown" && target.SuccessTs.HasValue) target.Status = "Success";
-                    result.Add(target);
-                    stack.Remove(target);
-                }
-                else
-                {
-                    // 고아 End → 0초 세션
-                    result.Add(new CombinedRow
-                    {
-                        Var = r.Var,
-                        StartTs = r.Timestamp,
-                        EndTs = r.Timestamp,
-                        Status = "Unknown",
-                        SourceFile = r.SourceFile,
-                        StartIdx = (int)r.LineIndex,
-                        EndIdx = (int)r.LineIndex,
-                        DurationSeconds = 0
-                    });
-                }
-                break;
-            }
-        }
-    }
-
-    // 파일 끝에서 아직 열린 세션 정리
-    foreach (var kv in open)
-    {
-        foreach (var cur in kv.Value)
-        {
-            if (!cur.EndTs.HasValue)
-            {
-                cur.EndTs = cur.SuccessTs ?? cur.StartTs;
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
-            }
-            if (cur.Status == "Unknown" && cur.SuccessTs.HasValue) cur.Status = "Success";
-            result.Add(cur);
-        }
-    }
-
-    return result.OrderBy(x => x.StartTs).ToList();
-}
-
-
-
-
-mergedRows = BuildMergedHybrid(forMerged.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex));
-
-
-
-
+using System;
 using System.Text.RegularExpressions;
 
-public static bool HasMissingAmpersand(string text)
+public static class MemorySpecValidator
 {
-    if (string.IsNullOrWhiteSpace(text))
-        return false;
+    /// <summary>
+    /// 전체 형식이 맞는지 검사
+    /// TYPE:ADDRESS:LENGTH (&TYPE:ADDRESS:LENGTH ...) 구조
+    /// ADDRESS = 16진수 (0~9, A~F)
+    /// LENGTH  = 10진수
+    /// </summary>
+    public static bool IsValidMemorySpec(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
 
-    string s = text.Replace(" ", "");
+        string s = text.Replace(" ", "");
 
-    // ① [정상블록][정상블록]이 그대로 붙어있는 경우
-    //    예: "B:1000:10W:100A:10"
-    //
-    // ② 주소 안에 새 디바이스 블록이 끼어든 경우
-    //    예: "W:100B:100:2"  (원래는 "W:1000&B:100:2" 여야 함)
-    const string pattern = 
-        @"(?:[A-Za-z]{1,3}:[0-9A-Fa-f]+:\d+(?=[A-Za-z]{1,3}:[0-9A-Fa-f]+:\d+))" // ①
-        + @"|(?:[0-9A-Fa-f]+[A-Za-z]{1,3}:\d+:\d+)";                           // ②
+        // TYPE:HEXADDR:LENGTH (&TYPE:HEXADDR:LENGTH)*
+        const string pattern =
+            @"^(?:[A-Za-z]{1,3}:[0-9A-Fa-f]+:\d+)(?:&[A-Za-z]{1,3}:[0-9A-Fa-f]+:\d+)*$";
 
-    return Regex.IsMatch(s, pattern);
-}
+        return Regex.IsMatch(s, pattern);
+    }
 
+    /// <summary>
+    /// & 가 빠진 케이스 감지
+    /// 예) B:1000:10W:100A:10
+    /// 예) W:100B:100:2
+    /// 예) D:0:1B:10:2
+    /// 숫자 뒤에 TYPE이 바로 붙으면 & 누락으로 간주
+    /// </summary>
+    public static bool HasMissingAmpersand(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
 
-public static bool IsValidMemorySpec(string text)
-{
-    if (string.IsNullOrWhiteSpace(text))
-        return false;
+        string s = text.Replace(" ", "");
 
-    string s = text.Replace(" ", "");
+        // 숫자 + TYPE: 패턴 → 새 블록인데 &가 없음
+        // 예: "10W:" / "100B:" / "1B:"
+        const string pattern = @"\d+[A-Za-z]{1,3}:";
 
-    // TYPE:숫자:숫자 (&TYPE:숫자:숫자)* 전체 형식
-    const string pattern =
-        @"^(?:[A-Za-z]{1,3}:\d+:\d+)(?:&[A-Za-z]{1,3}:\d+:\d+)*$";
+        return Regex.IsMatch(s, pattern);
+    }
 
-    return Regex.IsMatch(s, pattern);
-}
+    /// <summary>
+    /// 최종 검증: 전체 형식 + &누락 검사
+    /// </summary>
+    public static bool IsSafeMemorySpec(string text)
+    {
+        if (!IsValidMemorySpec(text))
+            return false;
 
+        if (HasMissingAmpersand(text))
+            return false;
 
+        return true;
+    }
 
+    /// <summary>
+    /// 파싱 (검증 통과한 문자열만 넣어야 함)
+    /// </summary>
+    public static (string type, int address, int length)[] Parse(string text)
+    {
+        string s = text.Replace(" ", "");
+        string[] blocks = s.Split('&');
 
+        var result = new (string type, int address, int length)[blocks.Length];
 
-string spec = txtInput.Text;
+        for (int i = 0; i < blocks.Length; i++)
+        {
+            var parts = blocks[i].Split(':');
+            string type = parts[0];
+            string addrHex = parts[1];   // HEX 주소
+            string lengthText = parts[2];
 
-// 공백 제거 후 검사
-spec = spec?.Trim();
+            int addr = Convert.ToInt32(addrHex, 16);
+            int len = int.Parse(lengthText);
 
-// 1단계: 형식 자체가 유효한지
-if (!IsValidMemorySpec(spec))
-{
-    MessageBox.Show(
-        "메모리 구간 문자열 형식이 잘못되었습니다.\r\n" +
-        "형식: TYPE:ADDRESS:LENGTH (&TYPE:ADDRESS:LENGTH ...)\r\n" +
-        "예) B:1000:10&W:A00:100"
-    );
-    return;
-}
+            result[i] = (type, addr, len);
+        }
 
-// 2단계: 그래도 '& 누락' 의심되는 패턴 한번 더 체크 (선택)
-if (HasMissingAmpersand(spec))
-{
-    MessageBox.Show(
-        "구간 사이에 & 가 빠진 것 같습니다.\r\n" +
-        "예) B:1000:10W:A00:100  →  B:1000:10&W:A00:100"
-    );
-    return;
-}
-
-// 여기까지 통과하면 안심하고 파싱
-foreach (var block in spec.Replace(" ", "").Split('&'))
-{
-    var parts = block.Split(':'); // [0] = TYPE, [1] = ADDRESS(hex), [2] = LENGTH
-
-    string type  = parts[0];
-    string addrHex = parts[1];
-    string lenText = parts[2];
-
-    int address = Convert.ToInt32(addrHex, 16); // 16진 주소를 정수로
-    int length  = int.Parse(lenText);
-
-    // TODO: MXComponent 요청용 구조로 사용
+        return result;
+    }
 }
