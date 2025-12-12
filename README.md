@@ -170,3 +170,48 @@ public static bool IsValidMemorySpec(string text)
 
     return Regex.IsMatch(s, pattern);
 }
+
+
+
+
+
+string spec = txtInput.Text;
+
+// 공백 제거 후 검사
+spec = spec?.Trim();
+
+// 1단계: 형식 자체가 유효한지
+if (!IsValidMemorySpec(spec))
+{
+    MessageBox.Show(
+        "메모리 구간 문자열 형식이 잘못되었습니다.\r\n" +
+        "형식: TYPE:ADDRESS:LENGTH (&TYPE:ADDRESS:LENGTH ...)\r\n" +
+        "예) B:1000:10&W:A00:100"
+    );
+    return;
+}
+
+// 2단계: 그래도 '& 누락' 의심되는 패턴 한번 더 체크 (선택)
+if (HasMissingAmpersand(spec))
+{
+    MessageBox.Show(
+        "구간 사이에 & 가 빠진 것 같습니다.\r\n" +
+        "예) B:1000:10W:A00:100  →  B:1000:10&W:A00:100"
+    );
+    return;
+}
+
+// 여기까지 통과하면 안심하고 파싱
+foreach (var block in spec.Replace(" ", "").Split('&'))
+{
+    var parts = block.Split(':'); // [0] = TYPE, [1] = ADDRESS(hex), [2] = LENGTH
+
+    string type  = parts[0];
+    string addrHex = parts[1];
+    string lenText = parts[2];
+
+    int address = Convert.ToInt32(addrHex, 16); // 16진 주소를 정수로
+    int length  = int.Parse(lenText);
+
+    // TODO: MXComponent 요청용 구조로 사용
+}
