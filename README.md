@@ -100,3 +100,15 @@ void ApplyClassicGridStyle(DataGridView dgv)
     dgv.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(240, 240, 240);
     dgv.ColumnHeadersDefaultCellStyle.ForeColor = Color.Black;
 }
+
+
+
+
+dataGridView1.EnableHeadersVisualStyles = false;
+
+dataGridView1.GridColor = Color.FromArgb(224, 224, 224); // 핵심
+dataGridView1.CellBorderStyle = DataGridViewCellBorderStyle.Single;
+dataGridView1.AdvancedCellBorderStyle.All =
+    DataGridViewAdvancedCellBorderStyle.Single;
+
+dataGridView1.BorderStyle = BorderStyle.FixedSingle;
