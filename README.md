@@ -84,3 +84,19 @@ public static class MemorySpecValidator
         return result;
     }
 }
+
+
+void ApplyClassicGridStyle(DataGridView dgv)
+{
+    dgv.EnableHeadersVisualStyles = false;
+
+    dgv.GridColor = Color.FromArgb(224, 224, 224);
+    dgv.BackgroundColor = Color.White;
+    dgv.BorderStyle = BorderStyle.FixedSingle;
+
+    dgv.CellBorderStyle = DataGridViewCellBorderStyle.Single;
+    dgv.AdvancedCellBorderStyle.All = DataGridViewAdvancedCellBorderStyle.Single;
+
+    dgv.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(240, 240, 240);
+    dgv.ColumnHeadersDefaultCellStyle.ForeColor = Color.Black;
+}
