@@ -40,3 +40,30 @@ public class PopupBrowserForm : Form
         };
     }
 }
+
+
+
+
+private async void CoreWebView2_NewWindowRequested(object? sender, Microsoft.Web.WebView2.Core.CoreWebView2NewWindowRequestedEventArgs e)
+{
+    // 팝업(새창) 요청을 우리가 처리
+    e.Handled = true;
+
+    // 새 폼 + 새 WebView2 만들기
+    var popup = new PopupBrowserForm();
+
+    // 폼 Show 먼저 (핸들 생성)
+    popup.Show(this);
+
+    // 새 WebView2가 준비되면 그걸 새 창 대상(NewWindow)으로 연결
+    await popup.EnsureInitializedAsync(_web.CoreWebView2.Environment);
+
+    // 이게 핵심: "새창"을 새 WebView2로 연결
+    e.NewWindow = popup.WebView.CoreWebView2;
+
+    // 혹시 URI가 같이 넘어오는 경우도 있어서 안전하게 보강
+    if (!string.IsNullOrWhiteSpace(e.Uri))
+    {
+        popup.WebView.CoreWebView2.Navigate(e.Uri);
+    }
+}
