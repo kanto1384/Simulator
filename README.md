@@ -1,21 +1,26 @@
-private void FitGridColumns(DataGridView grid)
+private void FitGridColumnsOnce(DataGridView grid)
 {
     if (grid.Columns.Count == 0) return;
 
+    // 화면 깜빡임 줄이기
     grid.SuspendLayout();
     try
     {
-        // ✅ 사용자 수동 조절 허용
-        grid.AllowUserToResizeColumns = true;
+        // 현재 사용자의 수동 리사이즈 환경을 그대로 유지
+        // (AutoSizeMode/AutoSizeColumnsMode 절대 변경하지 않음)
 
-        // ✅ "계산용"으로 잠깐 자동 사이즈 켠 다음
-        // (각 컬럼 AutoSizeMode를 쓰는 경우가 많아서)
+        // 1) 현재 각 컬럼의 AutoSizeMode 백업
+        var backup = new Dictionary<DataGridViewColumn, DataGridViewAutoSizeColumnMode>();
+        foreach (DataGridViewColumn c in grid.Columns)
+            backup[c] = c.AutoSizeMode;
+
+        // 2) 잠깐 AllCells로 바꿔서 "추천 폭" 계산
         foreach (DataGridViewColumn c in grid.Columns)
             c.AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells;
 
-        // preferred width 계산
         grid.AutoResizeColumns(DataGridViewAutoSizeColumnsMode.AllCells);
 
+        // 3) 계산된 Width를 최대폭까지만 제한
         const int maxWide = 380;
         const int maxMid = 260;
         const int maxNarrow = 180;
@@ -37,17 +42,12 @@ private void FitGridColumns(DataGridView grid)
                      header.Contains("목록", StringComparison.OrdinalIgnoreCase))
                 max = maxWide;
 
-            // ✅ 계산된 폭을 최대폭으로 제한
             if (c.Width > max) c.Width = max;
-            c.MinimumWidth = 80;
-
-            // ✅ 여기서 AutoSize를 끄면 "수동 조절"이 살아남
-            c.AutoSizeMode = DataGridViewAutoSizeColumnMode.None;
-            c.Resizable = DataGridViewTriState.True;
         }
 
-        // (선택) 긴 셀은 툴팁으로 전체 보기
-        grid.ShowCellToolTips = true;
+        // 4) 원래 AutoSizeMode로 복원 (⭐ 수동 리사이즈 유지의 핵심)
+        foreach (var kv in backup)
+            kv.Key.AutoSizeMode = kv.Value;
     }
     finally
     {
