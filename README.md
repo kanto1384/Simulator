@@ -1,35 +1,32 @@
-private void FitGridColumnsLikeExcel(DataGridView grid)
+private void ApplyKoreanHeadersSimple(DataGridView grid)
 {
-    if (grid.Columns.Count == 0) return;
-
-    grid.SuspendLayout();
-    try
+    foreach (DataGridViewColumn col in grid.Columns)
     {
-        foreach (DataGridViewColumn c in grid.Columns)
+        switch (col.HeaderText)
         {
-            // 엑셀 더블클릭과 동일:
-            // 헤더 + 모든 셀 중 가장 긴 값 기준
-            int preferred =
-                c.GetPreferredWidth(DataGridViewAutoSizeColumnMode.AllCells, true);
+            case "Ip":
+                col.HeaderText = "IP";
+                break;
 
-            // 그대로 적용 (여유 패딩 약간)
-            c.Width = preferred + 8;
+            case "Host":
+                col.HeaderText = "호스트";
+                break;
+
+            case "EquipmentGroup":
+                col.HeaderText = "장비군";
+                break;
+
+            case "EquipmentList":
+                col.HeaderText = "장비목록";
+                break;
+
+            case "Location":
+                col.HeaderText = "위치";
+                break;
+
+            case "Note":
+                col.HeaderText = "비고";
+                break;
         }
     }
-    finally
-    {
-        grid.ResumeLayout();
-    }
-}
-
-
-_grid.DataBindingComplete -= Grid_DataBindingComplete;
-_grid.DataBindingComplete += Grid_DataBindingComplete;
-
-private void Grid_DataBindingComplete(object? sender, DataGridViewBindingCompleteEventArgs e)
-{
-    BeginInvoke(new Action(() =>
-    {
-        FitGridColumnsLikeExcel(_grid);
-    }));
 }
