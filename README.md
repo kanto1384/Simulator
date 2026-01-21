@@ -2,31 +2,18 @@ private void FitGridColumnsOnce(DataGridView grid)
 {
     if (grid.Columns.Count == 0) return;
 
-    // 화면 깜빡임 줄이기
     grid.SuspendLayout();
     try
     {
-        // 현재 사용자의 수동 리사이즈 환경을 그대로 유지
-        // (AutoSizeMode/AutoSizeColumnsMode 절대 변경하지 않음)
-
-        // 1) 현재 각 컬럼의 AutoSizeMode 백업
-        var backup = new Dictionary<DataGridViewColumn, DataGridViewAutoSizeColumnMode>();
-        foreach (DataGridViewColumn c in grid.Columns)
-            backup[c] = c.AutoSizeMode;
-
-        // 2) 잠깐 AllCells로 바꿔서 "추천 폭" 계산
-        foreach (DataGridViewColumn c in grid.Columns)
-            c.AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells;
-
-        grid.AutoResizeColumns(DataGridViewAutoSizeColumnsMode.AllCells);
-
-        // 3) 계산된 Width를 최대폭까지만 제한
-        const int maxWide = 380;
-        const int maxMid = 260;
-        const int maxNarrow = 180;
+        const int maxWide = 380;   // 긴 텍스트(장비목록 등)
+        const int maxMid = 260;    // 일반
+        const int maxNarrow = 180; // IP/Host 같은 짧은
 
         foreach (DataGridViewColumn c in grid.Columns)
         {
+            // ✅ “현재 들어있는 데이터 기준”으로 추천 폭 계산
+            int w = c.GetPreferredWidth(DataGridViewAutoSizeColumnMode.AllCells, true);
+
             int max = maxMid;
             var name = c.Name ?? "";
             var header = c.HeaderText ?? "";
@@ -42,12 +29,12 @@ private void FitGridColumnsOnce(DataGridView grid)
                      header.Contains("목록", StringComparison.OrdinalIgnoreCase))
                 max = maxWide;
 
-            if (c.Width > max) c.Width = max;
-        }
+            // ✅ clamp + 약간의 여유(헤더/패딩 때문에 6~10px 더 필요할 때가 많음)
+            w = Math.Min(w + 10, max);
 
-        // 4) 원래 AutoSizeMode로 복원 (⭐ 수동 리사이즈 유지의 핵심)
-        foreach (var kv in backup)
-            kv.Key.AutoSizeMode = kv.Value;
+            // ✅ 폭만 설정 (AutoSizeMode/AutoSizeColumnsMode는 건드리지 않음)
+            c.Width = w;
+        }
     }
     finally
     {
