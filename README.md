@@ -21,3 +21,15 @@ private void FitGridColumnsLikeExcel(DataGridView grid)
         grid.ResumeLayout();
     }
 }
+
+
+_grid.DataBindingComplete -= Grid_DataBindingComplete;
+_grid.DataBindingComplete += Grid_DataBindingComplete;
+
+private void Grid_DataBindingComplete(object? sender, DataGridViewBindingCompleteEventArgs e)
+{
+    BeginInvoke(new Action(() =>
+    {
+        FitGridColumnsLikeExcel(_grid);
+    }));
+}
