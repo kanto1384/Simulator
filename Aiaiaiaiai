@@ -1,0 +1,282 @@
+좋아. 네가 올린 소스(MainForm.cs) 열어봤고, 지금 구조에 딱 맞게 “빨간색 만료(#ff0000) 행은 스킵 + td[14] 종료일로 D-day 계산해서 그리드에 표시”가 되도록 필요한 코드만 줄게. (복붙용)
+
+
+아래는 MainForm.cs에서 바꿀/추가할 것들이다.
+
+
+
+0) using 1줄 추가
+
+
+MainForm.cs 상단 using들에 이거 추가:
+
+
+using System.Globalization;
+
+
+
+
+1) ExtractIpHostAsync()를 “만료/종료일 포함” 버전으로 교체
+
+
+✅ 이 메서드 전체를 통째로 교체해
+
+
+기존 private async Task<List<(string Ip, string Host)>> ExtractIpHostAsync() 부분을 아래로 그대로 교체:
+
+
+private async Task<List<(string Ip, string Host, string EndAtText, bool IsExpired)>> ExtractIpHostAsync()
+{
+    //  - 6th td = IP  (index 5)
+    //  - 7th td = Host (index 6)
+    //  - 15th td = EndAt (index 14)
+    //  - expired rows: td style includes #ff0000 (fixed)
+    const string js = """
+    (() => {
+      const rows = Array.from(document.querySelectorAll('#seltable tbody tr'));
+      const out = [];
+      for (const tr of rows) {
+        const tds = tr.querySelectorAll('td');
+        if (!tds || tds.length < 15) continue;
+
+        const ip = (tds[5].innerText || '').trim();
+        const host = (tds[6].innerText || '').trim();
+        const endAt = (tds[14].innerText || '').trim();
+
+        // 만료 판정: style 속성에 #ff0000 포함(고정)
+        // (행 전체/일부 td에 걸릴 수 있으니, tr 안의 td style을 전체 스캔)
+        let expired = false;
+        for (const td of tds) {
+          const style = (td.getAttribute('style') || '').toLowerCase();
+          if (style.includes('#ff0000')) { expired = true; break; }
+        }
+
+        if (!ip && !host) continue;
+        out.push({ ip, host, endAt, expired });
+      }
+
+      // 중복 제거(같은 ip|host) - expired/정상 섞인 경우는 "정상 우선"으로 남김
+      const map = new Map();
+      for (const x of out) {
+        const key = (x.ip + '|' + x.host).toLowerCase();
+        if (!map.has(key)) { map.set(key, x); continue; }
+        const cur = map.get(key);
+        // 정상(false)이 있으면 정상 우선
+        if (cur.expired && !x.expired) map.set(key, x);
+      }
+
+      return Array.from(map.values());
+    })();
+    """;
+
+    var json = await _web.CoreWebView2.ExecuteScriptAsync(js);
+    var items = JsonSerializer.Deserialize<List<PortalRowDto>>(json) ?? new();
+
+    return items
+        .Select(x => (
+            Ip: (x.ip ?? "").Trim(),
+            Host: (x.host ?? "").Trim(),
+            EndAtText: (x.endAt ?? "").Trim(),
+            IsExpired: x.expired
+        ))
+        .Where(x => !string.IsNullOrWhiteSpace(x.Ip) || !string.IsNullOrWhiteSpace(x.Host))
+        .ToList();
+}
+
+private sealed class PortalRowDto
+{
+    public string? ip { get; set; }
+    public string? host { get; set; }
+    public string? endAt { get; set; }
+    public bool expired { get; set; }
+}
+
+
+
+
+
+포인트
+
+
+
+
+td[14] 종료일 텍스트를 endAt로 가져옴
+
+
+#ff0000가 있는 td가 하나라도 있으면 expired=true
+
+
+중복(ip|host) 있을 때 정상 우선으로 1개만 남김
+
+
+
+
+
+
+
+2) 종료일 포맷 파싱 + D-day 계산 함수 추가
+
+
+MainForm.cs 아래 아무 곳(클래스 내부)에 헬퍼 함수 2개 추가:
+
+
+private static bool TryParseEndAt(string s, out DateTime endAt)
+{
+    return DateTime.TryParseExact(
+        s.Trim(),
+        "yyyy-MM-dd HH:mm",
+        CultureInfo.InvariantCulture,
+        DateTimeStyles.AssumeLocal,
+        out endAt
+    );
+}
+
+private static string ToDDayText(DateTime endAt)
+{
+    var d = (int)Math.Floor((endAt - DateTime.Now).TotalDays);
+    if (d >= 0) return $"D-{d}";
+    return $"만료(D+{-d})";
+}
+
+
+
+
+3) BuildRows()를 만료 스킵 + D-day 포함으로 교체
+
+
+기존 BuildRows(List<(string Ip, string Host)> extracted, ...)를 아래로 통째로 교체:
+
+
+private static List<ViewRow> BuildRows(
+    List<(string Ip, string Host, string EndAtText, bool IsExpired)> extracted,
+    DeviceIndex index)
+{
+    var rows = new List<ViewRow>(extracted.Count);
+
+    foreach (var (ip, host, endAtText, isExpired) in extracted)
+    {
+        // ✅ 만료(빨간색)는 스킵(안 보이게)
+        if (isExpired) continue;
+
+        // D-day 계산(종료일 없거나 파싱 실패하면 공백)
+        string dday = "";
+        if (!string.IsNullOrWhiteSpace(endAtText) && TryParseEndAt(endAtText, out var endAt))
+            dday = ToDDayText(endAt);
+
+        DeviceItem? item = null;
+
+        if (!string.IsNullOrWhiteSpace(host) && index.ByHost.TryGetValue(host, out var byHost))
+            item = byHost;
+        else if (!string.IsNullOrWhiteSpace(ip) && index.ByIp.TryGetValue(ip, out var byIp))
+            item = byIp;
+
+        if (item is null)
+        {
+            rows.Add(new ViewRow(ip, host, endAtText, dday, "", "", "", "", "매핑 없음"));
+            continue;
+        }
+
+        var listText = item.equipmentList is { Count: > 0 }
+            ? string.Join(", ", item.equipmentList)
+            : "";
+
+        rows.Add(new ViewRow(
+            ip,
+            host,
+            endAtText,
+            dday,
+            item.equipmentGroup ?? "",
+            listText,
+            item.location ?? "",
+            item.note ?? "",
+            "OK"));
+    }
+
+    // 정렬: 곧 만료(D-작은값) 위로 올리고 싶으면 여기서 커스텀도 가능
+    return rows
+        .OrderBy(r => r.Status == "매핑 없음" ? 1 : 0)
+        .ThenBy(r => r.EquipmentGroup)
+        .ThenBy(r => r.Host)
+        .ToList();
+}
+
+
+
+
+4) ViewRow record에 컬럼 2개(EndAt, DDay) 추가
+
+
+맨 아래 public sealed record ViewRow(...)를 아래로 통째로 교체:
+
+
+public sealed record ViewRow(
+    string Ip,
+    string Host,
+    string EndAt,
+    string DDay,
+    string EquipmentGroup,
+    string EquipmentListText,
+    string Location,
+    string Note,
+    string Status);
+
+
+
+
+5) ApplySearchFilter()에 DDay/EndAt도 검색 포함(원하면)
+
+
+현재 검색 조건에 EndAt, DDay도 포함시키고 싶으면, ApplySearchFilter()의 Where에 아래 2줄 추가:
+
+
+ContainsIgnoreCase(r.EndAt, q) ||
+ContainsIgnoreCase(r.DDay, q) ||
+
+
+
+예: 지금 ContainsIgnoreCase(r.Status, q) 앞쪽 아무 데나 끼워 넣으면 됨.
+
+
+
+6) ExtractAndShowAsync()에서 타입 변경 반영
+
+
+ExtractAndShowAsync() 안에서 이 줄:
+
+
+var extracted = await ExtractIpHostAsync();
+_currentRows = BuildRows(extracted, _index);
+
+
+
+이건 그대로 두면 됨(위에서 시그니처를 바꿔서 컴파일이 알아서 맞춰짐).
+
+
+
+그 다음 (그리드 헤더 한글화)
+
+
+너가 원하면 Ip/Host/EndAt/DDay를 “IP/호스트/종료/잔여일” 이런 식으로 HeaderText만 바꿔줄 수 있어.
+
+(이건 이전에 하던 것처럼 DataBindingComplete에서 HeaderText만 바꾸면 끝)
+
+
+
+원하는 동작 체크:
+
+
+
+
+#ff0000 행은 아예 리스트에서 제거(continue) ✅
+
+
+td[14]의 "2026-03-10 09:00" 파싱해서 D-day 표시 ✅
+
+
+중복은 (ip|host) 기준으로 정상 우선 1개만 남김 ✅
+
+
+
+
+이대로 붙여넣고 빌드해봐. 컴파일 에러가 나면, 에러 메시지 그대로 보내줘(한 줄만). 바로 그 위치 기준으로 더 좁혀서 패치 줄게.
+
