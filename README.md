@@ -1,55 +1,35 @@
-private async void CoreWebView2_NewWindowRequested(
-    object? sender,
-    Microsoft.Web.WebView2.Core.CoreWebView2NewWindowRequestedEventArgs e)
+public async Task EnsureInitializedAsync(CoreWebView2Environment env)
 {
-    // 🔥 이거 없으면 100% 두 개 뜨거나 터짐
-    var deferral = e.GetDeferral();
+    await WebView.EnsureCoreWebView2Async(env);
 
-    try
+    // JS에서 "CLICKED" 메시지 보내면 팝업 닫기
+    WebView.CoreWebView2.WebMessageReceived += (s, e) =>
     {
-        e.Handled = true;
+        if (e.TryGetWebMessageAsString() == "CLOSE_POPUP")
+        {
+            BeginInvoke(new Action(() => Close()));
+        }
+    };
 
-        // 팝업 Form 먼저 생성 (아직 Navigate ❌)
-        var popup = new PopupBrowserForm();
-
-        // WebView2를 "같은 Environment"로 즉시 초기화
-        await popup.EnsureInitializedAsync(_web.CoreWebView2.Environment);
-
-        // 🔥 핵심: 엔진에게 "이 WebView가 새창이다"를 먼저 알려줌
-        e.NewWindow = popup.WebView.CoreWebView2;
-
-        // 이제 보여줘도 안전
-        popup.Show(this);
-    }
-    finally
+    // 페이지 로드되면 '접속하기' 버튼 클릭을 감지해서 메시지 보내기
+    WebView.CoreWebView2.NavigationCompleted += async (s, e) =>
     {
-        // 🔥 엔진에게 "처리 끝" 신호
-        deferral.Complete();
-    }
-}
+        const string js = """
+        (() => {
+          const btn = document.querySelector('#pop_wrapper #pop_container #pop_btn a.btn1_2');
+          if (!btn) return;
 
+          if (btn.dataset.__closeHook === '1') return;
+          btn.dataset.__closeHook = '1';
 
+          btn.addEventListener('click', () => {
+            // send_value()는 원래대로 실행되고,
+            // 우리는 "닫아!"만 C#에 알림
+            window.chrome?.webview?.postMessage('CLOSE_POPUP');
+          }, true);
+        })();
+        """;
 
-
-
-
-public class PopupBrowserForm : Form
-{
-    public WebView2 WebView { get; } = new WebView2();
-
-    public PopupBrowserForm()
-    {
-        Text = "Remote Connection";
-        Width = 1100;
-        Height = 800;
-        StartPosition = FormStartPosition.CenterParent;
-
-        WebView.Dock = DockStyle.Fill;
-        Controls.Add(WebView);
-    }
-
-    public async Task EnsureInitializedAsync(CoreWebView2Environment env)
-    {
-        await WebView.EnsureCoreWebView2Async(env);
-    }
+        try { await WebView.CoreWebView2.ExecuteScriptAsync(js); } catch { }
+    };
 }
