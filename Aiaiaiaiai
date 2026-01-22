@@ -1,55 +1,98 @@
-private static List<T> DedupPreferActiveKeepOrder<T>(
-    IEnumerable<T> webOrderedRows,
-    Func<T, string> keySelector,
-    Func<T, bool> isExpiredSelector,
-    Func<T, DateTime?> endAtSelector = null!)
+private System.Windows.Forms.Timer? _autoExtractTimer;
+private bool _autoExtractBusy;
+
+// 마지막 테이블 상태(변화 감지용)
+private int _lastRowCount = -1;
+private string _lastFirstKey = "";
+
+private async Task<bool> JsHasLoadingOverlayAsync()
 {
-    var outList = new List<T>();
-    var indexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    // ✅ Id_line / id_line 둘 다 체크
+    string js =
+        "(function(){" +
+        "  return !!(" +
+        "    document.querySelector('#id_line') || document.querySelector('#Id_line') ||" +
+        "    document.querySelector('#cont')" +
+        "  );" +
+        "})()";
 
-    foreach (var row in webOrderedRows)
+    var raw = await _web.CoreWebView2.ExecuteScriptAsync(js);
+    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
+}
+
+private async Task<(int rowCount, string firstKey)> JsGetTableSignatureAsync()
+{
+    // ✅ 테이블이 없으면 (0,"")
+    // ✅ 있으면 row count + 첫 행의 ip/host(네 인덱스 5,6)로 서명 생성
+    string js =
+        "(function(){" +
+        "  var rows = document.querySelectorAll('#seltable tbody tr');" +
+        "  if (!rows || rows.length === 0) return JSON.stringify({c:0,k:''});" +
+        "  var tds = rows[0].querySelectorAll('td');" +
+        "  var ip = (tds && tds.length>6) ? (tds[5].innerText||'').trim() : '';" +
+        "  var host = (tds && tds.length>6) ? (tds[6].innerText||'').trim() : '';" +
+        "  return JSON.stringify({c:rows.length,k:(ip+'|'+host)});" +
+        "})()";
+
+    var raw = await _web.CoreWebView2.ExecuteScriptAsync(js);
+
+    // WebView2 반환은 JSON string이므로 한 번 풀기
+    var jsonText = System.Text.Json.JsonSerializer.Deserialize<string>(raw) ?? "{\"c\":0,\"k\":\"\"}";
+    using var doc = System.Text.Json.JsonDocument.Parse(jsonText);
+
+    int c = 0;
+    string k = "";
+    if (doc.RootElement.TryGetProperty("c", out var pc)) c = pc.GetInt32();
+    if (doc.RootElement.TryGetProperty("k", out var pk)) k = pk.GetString() ?? "";
+
+    return (c, k);
+}
+
+private void StartAutoExtractWatcher()
+{
+    if (_autoExtractTimer != null) return;
+
+    _autoExtractTimer = new System.Windows.Forms.Timer();
+    _autoExtractTimer.Interval = 200; // ✅ 항상 200ms로 가도 부담 거의 없음(짧은 로딩 놓치지 않게)
+
+    _autoExtractTimer.Tick += async (s, e) =>
     {
-        var key = keySelector(row);
-        if (string.IsNullOrWhiteSpace(key)) continue;
+        if (_autoExtractBusy) return;
+        if (_web.CoreWebView2 == null) return;
 
-        if (!indexByKey.TryGetValue(key, out var idx))
+        _autoExtractBusy = true;
+        try
         {
-            // 첫 등장: 웹 순서대로 추가
-            indexByKey[key] = outList.Count;
-            outList.Add(row);
-            continue;
+            // 1) 로딩 오버레이가 보이면 추출 금지(아직 갱신 중)
+            bool isLoading = await JsHasLoadingOverlayAsync();
+            if (isLoading) return;
+
+            // 2) 로딩이 없을 때 테이블 시그니처 확인
+            var sig = await JsGetTableSignatureAsync();
+
+            // 테이블이 아직 없으면 스킵
+            if (sig.rowCount <= 0) return;
+
+            // 3) "테이블 내용이 바뀐 순간"에만 자동 추출
+            // (오버레이를 못 봐도 변화가 생기면 잡힘)
+            bool changed = (sig.rowCount != _lastRowCount) || !string.Equals(sig.firstKey, _lastFirstKey, StringComparison.Ordinal);
+
+            if (!changed) return;
+
+            _lastRowCount = sig.rowCount;
+            _lastFirstKey = sig.firstKey;
+
+            await ExtractAndShowAsync();
         }
-
-        // 중복: 기존과 새 것을 비교해서 "정상 우선"으로 교체 (자리 유지)
-        var cur = outList[idx];
-        var curExpired = isExpiredSelector(cur);
-        var newExpired = isExpiredSelector(row);
-
-        // 1) 만료 -> 정상으로 업그레이드: 무조건 교체
-        if (curExpired && !newExpired)
+        catch
         {
-            outList[idx] = row;
-            continue;
+            // 무시(일시 DOM 변경/로그인 전/전환 중)
         }
-
-        // 2) 둘 다 같은 상태면(둘 다 정상 or 둘 다 만료) 종료일이 더 늦은 걸로 교체(선택)
-        if (!curExpired && !newExpired && endAtSelector != null)
+        finally
         {
-            var curEnd = endAtSelector(cur);
-            var newEnd = endAtSelector(row);
-            if (newEnd.HasValue && (!curEnd.HasValue || newEnd.Value > curEnd.Value))
-                outList[idx] = row;
+            _autoExtractBusy = false;
         }
-        else if (curExpired && newExpired && endAtSelector != null)
-        {
-            var curEnd = endAtSelector(cur);
-            var newEnd = endAtSelector(row);
-            if (newEnd.HasValue && (!curEnd.HasValue || newEnd.Value > curEnd.Value))
-                outList[idx] = row;
-        }
+    };
 
-        // 그 외는 기존 유지 (웹에서 먼저 나온 자리 유지)
-    }
-
-    return outList;
+    _autoExtractTimer.Start();
 }
