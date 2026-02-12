@@ -1,109 +1,164 @@
-맞아. 내가 “어디서 읽어서 어떤 변수에 넣는지” 그 연결 코드를 안 줬네.
-
-지금 네 상황에서 “추가해야 하는 부분만” 딱 주면, 이렇게 하면 끝이야.
+ㅇㅇ 그거면 원인 100% 맞아. 첫 화면이 “안전하지 않음(인증서 경고 interstitial)” 페이지라서, 네가 넣은 selector(user ID, PASSWD)가 아예 존재하지 않으니 당연히 Fill이 안 먹는 거야.
 
 
-아래는 MainForm에 추가할 최소 코드 3덩어리야.
-
-
-
-1) MainForm 필드 2개 추가 (팝업에 넘길 값 저장용)
-
-
-MainForm 클래스 필드 쪽에 추가:
-
-
-private string? _loginIdFromJson;
-private string? _loginPwFromJson;
+해결은 간단하게 2단계로 하면 됨:
 
 
 
 
-2) device_map.json에서 credentials 읽는 함수 추가 (MainForm 안에)
+경고 페이지면 “계속(Proceed)”만 눌러주고
 
 
-private (string? id, string? pw) LoadCredentialsFromMap(string mapPath)
+진짜 로그인 페이지가 뜨면 ID/PW 채우기
+
+
+
+
+아래는 추가할 부분만.
+
+
+
+1) PopupBrowserForm에 “경고페이지 처리 + 로그인 입력” 한 방 폴링 함수 추가
+
+
+private async Task AutoHandleCertThenFillAsync(string id, string pw)
 {
-    try
+    for (int i = 0; i < 60; i++) // 최대 60회 * 200ms = 12초
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(mapPath));
-        if (!doc.RootElement.TryGetProperty("credentials", out var cred))
-            return (null, null);
+        // 1) 인증서 경고 interstitial이면 "계속" 버튼 누르기 시도
+        var didProceed = await TryClickProceedUnsafeAsync();
+        if (didProceed)
+        {
+            await Task.Delay(300); // 화면 전환 약간 기다림
+            continue;
+        }
 
-        string? id = cred.TryGetProperty("id", out var pid) ? pid.GetString() : null;
-        string? pw = cred.TryGetProperty("pw", out var ppw) ? ppw.GetString() : null;
+        // 2) 로그인 input이 뜨면 채우고 종료
+        var filled = await TryFillLoginOnceAsync(id, pw);
+        if (filled) return;
 
-        return (id, pw);
-    }
-    catch
-    {
-        return (null, null);
+        await Task.Delay(200);
     }
 }
 
 
 
 
-
-전제: device_map.json 최상위에 아래처럼 넣어둬야 함
-
-"credentials": { "id": "...", "pw": "..." }
+2) “Proceed(안전하지 않음 → 계속)” 클릭 시도 함수 추가
 
 
+Chrome 계열 interstitial은 보통 id가 details-button, proceed-link 이런 식이라서 아래처럼 잡으면 꽤 잘 잡힘.
 
 
+private async Task<bool> TryClickProceedUnsafeAsync()
+{
+    var js = @"
+(() => {
+  // Chromium SSL interstitial common ids
+  const details = document.querySelector('#details-button');
+  if (details) { details.click(); return true; }
 
-3) ReloadMap()에서 “기존 로드 + credentials 로드” 연결 (여기가 너가 말한 ‘json 가져올 때 여기에 넣어야’ 부분)
+  const proceed = document.querySelector('#proceed-link');
+  if (proceed) { proceed.click(); return true; }
 
+  // 혹시 버튼/링크 텍스트로도 한번 더
+  const byText = Array.from(document.querySelectorAll('button,a'))
+    .find(x => (x.innerText || '').includes('Proceed') || (x.innerText || '').includes('계속'));
+  if (byText) { byText.click(); return true; }
 
-너 ReloadMap() 맨 마지막( _index = DeviceIndex.Load(MapPath); 바로 아래) 에 이 3줄만 추가:
+  return false;
+})();";
 
-
-var (id, pw) = LoadCredentialsFromMap(MapPath);
-_loginIdFromJson = id;
-_loginPwFromJson = pw;
-
-
-
-최종적으로 ReloadMap 일부가 이렇게 되는 느낌:
-
-
-_index = DeviceIndex.Load(MapPath);
-
-var (id, pw) = LoadCredentialsFromMap(MapPath);
-_loginIdFromJson = id;
-_loginPwFromJson = pw;
-
-
-
-
-4) (중요) 팝업 만들 때 SetAutoCredentials 호출 추가
-
-
-너 CoreWebView2_NewWindowRequested 안에서 popup 만든 직후에 딱 이거:
-
-
-if (!string.IsNullOrWhiteSpace(_loginIdFromJson) && !string.IsNullOrWhiteSpace(_loginPwFromJson))
-    popup.SetAutoCredentials(_loginIdFromJson!, _loginPwFromJson!);
+    var raw = await WebView.CoreWebView2.ExecuteScriptAsync(js);
+    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
+}
 
 
 
 
-정리
+3) 로그인 input “한 번만 시도” 함수 추가 (너 셀렉터 그대로)
+
+
+private async Task<bool> TryFillLoginOnceAsync(string id, string pw)
+{
+    var idJson = System.Text.Json.JsonSerializer.Serialize(id);
+    var pwJson = System.Text.Json.JsonSerializer.Serialize(pw);
+
+    var js = $@"
+(() => {{
+  const idEl = document.querySelector('input.input_txt[type=""text""][name=""user-defined""][id=""user ID""]');
+  const pwEl = document.querySelector('input.input_txt[type=""password""][name=""PASSWD""][id=""PASSWD""]');
+  if (!idEl || !pwEl) return false;
+
+  idEl.focus();
+  idEl.value = {idJson};
+  idEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
+  idEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
+
+  pwEl.focus();
+  pwEl.value = {pwJson};
+  pwEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
+  pwEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
+
+  return true;
+}})();
+";
+    var raw = await WebView.CoreWebView2.ExecuteScriptAsync(js);
+    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
+}
 
 
 
 
-“json 가져올 때 값을 여기에 넣어야” = ReloadMap()에서 _loginIdFromJson/_loginPwFromJson에 넣는 게 제일 자연스러움 (map 파일을 여기서 읽으니까)
+4) EnsureInitializedAsync의 DOMContentLoaded에서 “기존 Fill” 대신 이거 호출로 교체
 
 
-에러났던 loginIdFromJson 같은 건 변수 자체가 없어서 나는 거고, 위처럼 필드로 만들고 ReloadMap에서 채우면 해결
+기존에 FillLoginInputsAsync(...) 호출하던 부분을 이걸로 바꿔:
+
+
+WebView.CoreWebView2.DOMContentLoaded += async (s, e) =>
+{
+    try
+    {
+        if (string.IsNullOrWhiteSpace(_autoId) || string.IsNullOrWhiteSpace(_autoPw))
+            return;
+
+        await AutoHandleCertThenFillAsync(_autoId!, _autoPw!);
+    }
+    catch { }
+};
 
 
 
 
+로그인 버튼은?
 
-원하면 내가 네 device_map.json 기본 생성 코드도 살짝 수정해줄게.
 
-지금 너 코드가 파일 없으면 자동 생성하잖아? 거기에 credentials 기본 템플릿까지 같이 넣게 하면 “항상 키가 존재”해서 더 편해짐.
+네가 말한 것처럼 값만 넣는 게 안전이 맞아. (특히 interstitial→리다이렉트가 섞이면 자동 클릭은 사고 남)
+그래도 나중에 옵션으로 버튼 클릭 붙이고 싶으면 TryFillLoginOnceAsync에서 마지막에 버튼 클릭 한 줄만 추가하면 됨.
+
+
+
+추가로, 제일 안정적인 방법(참고)
+
+
+WebView2는 환경 옵션으로 인증서 오류 무시를 “정식으로” 켜는 건 제한적이라, 지금처럼 DOM에서 proceed를 눌러주는 방식이 현실적으로 제일 잘 먹혀.
+
+
+
+지금 네 “안전하지 않음” 화면에서 실제로 뜨는 버튼 텍스트가
+
+
+
+
+“고급(Advanced)”
+
+
+“(안전하지 않음) 계속(Proceed)”
+이런 구조면 위 코드가 그대로 먹을 확률이 높아.
+
+
+
+
+혹시 안 먹으면, 그 경고 페이지에서 버튼 element id만 한 번 알려줘(개발자도구 말고도 JS로 document.body.innerHTML 일부 찍어도 됨). 그러면 selector를 딱 맞춰줄게.
 
