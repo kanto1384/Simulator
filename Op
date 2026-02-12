@@ -1,45 +1,209 @@
-private async Task RegisterAutoLoginScriptAsync()
+오케이. URL이 매번 달라도 상관없이 “팝업 WebView에만” 스크립트 주입해서 헤더에서 (IP) 뽑고 → JSON(IP매핑)에서 plc/location을 → userid/passwd에 자동 입력되게 해줄게.
+
+(로그인 버튼 클릭 없음, 값만 넣음)
+
+
+아래는 추가/수정해야 하는 부분만이다.
+
+
+
+0) MainForm 필드 2개 추가
+
+
+private CoreWebView2Environment? _wve; // ✅ 메인/팝업 공용 env(인증서 무시)
+private string? _popupMapJson;         // ✅ { "ip": { "id": plc, "pw": location }, ... }
+
+
+
+
+1) EnsureWebViewAsync 수정 (env를 ignore-cert로 “한 번만” 만들고 재사용)
+
+
+EnsureWebViewAsync()에서 EnsureCoreWebView2Async() 부분을 아래로 교체:
+
+
+private async Task EnsureWebViewAsync()
 {
-    if (_web.CoreWebView2 == null) return;
-    if (string.IsNullOrWhiteSpace(_loginIdFromJson) || string.IsNullOrWhiteSpace(_loginPwFromJson)) return;
+    if (_wve == null)
+    {
+        var options = new CoreWebView2EnvironmentOptions("--ignore-certificate-errors");
+        _wve = await CoreWebView2Environment.CreateAsync(null, userDataFolder, options);
+    }
 
-    var idJson = JsonSerializer.Serialize(_loginIdFromJson);
-    var pwJson = JsonSerializer.Serialize(_loginPwFromJson);
+    await _web.EnsureCoreWebView2Async(_wve);
 
-    var js = $@"
+    StartAutoExtractWatcher();
+    _web.CoreWebView2.NewWindowRequested += CoreWebView2_NewWindowRequested;
+}
+
+
+
+
+
+이렇게 해야 팝업도 인증서 경고(안전하지 않음) 안 뜸.
+
+
+
+
+
+2) ReloadMap()에서 팝업용 IP→(id,pw) 맵 준비
+
+
+ReloadMap() 마지막에 한 줄 추가:
+
+
+_popupMapJson = BuildPopupMapJson(_index);
+
+
+
+그리고 함수 추가 (MainForm 클래스 안 아무데나):
+
+
+private static string BuildPopupMapJson(DeviceIndex index)
+{
+    // ip -> { id: plc, pw: location }
+    var dict = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var kv in index.ByIp)
+    {
+        var ip = (kv.Key ?? "").Trim();
+        var item = kv.Value;
+        if (string.IsNullOrWhiteSpace(ip) || item == null) continue;
+
+        dict[ip] = new
+        {
+            id = item.plc ?? "",
+            pw = item.location ?? ""
+        };
+    }
+
+    return JsonSerializer.Serialize(dict);
+}
+
+
+
+
+3) 팝업 열릴 때: 팝업 WebView에만 자동입력 스크립트 주입
+
+
+CoreWebView2_NewWindowRequested를 아래 형태로 수정(핵심만):
+
+
+private async void CoreWebView2_NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+{
+    var deferral = e.GetDeferral();
+    try
+    {
+        e.Handled = true;
+
+        var popup = new PopupBrowserForm();
+
+        // ✅ 팝업도 반드시 같은 env(=ignore cert)
+        if (_wve == null)
+        {
+            var options = new CoreWebView2EnvironmentOptions("--ignore-certificate-errors");
+            _wve = await CoreWebView2Environment.CreateAsync(null, userDataFolder, options);
+        }
+        await popup.WebView.EnsureCoreWebView2Async(_wve);
+
+        // ✅ URL이 항상 달라도 상관 없음: "팝업 WebView"에만 주입
+        if (!string.IsNullOrWhiteSpace(_popupMapJson))
+        {
+            await popup.WebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
+                BuildPopupAutoFillScript(_popupMapJson!)
+            );
+        }
+
+        e.NewWindow = popup.WebView.CoreWebView2;
+        popup.Show(this);
+    }
+    finally
+    {
+        deferral.Complete();
+    }
+}
+
+
+
+그리고 함수 추가(MainForm 클래스 안):
+
+
+private static string BuildPopupAutoFillScript(string mapJson)
+{
+    // pop_header text: "이름 | 명칭 (1.1.1.1)"
+    // inputs:
+    //   input#userid.txt_box2
+    //   input#passwd.txt_box2
+    return $@"
 (() => {{
-  const ID = {idJson};
-  const PW = {pwJson};
+  const MAP = {mapJson};
 
-  function tryFill() {{
-    const idEl = document.querySelector('input#USERID.input_txt, input#USERID, input[name=""USERID""]');
-    const pwEl = document.querySelector('input#PASSWD.input_txt, input#PASSWD, input[name=""PASSWD""]');
-    if (!idEl || !pwEl) return false;
-
-    const setVal = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-
-    function setInput(el, v) {{
-      el.focus();
-      if (setVal) setVal.call(el, v);
-      else el.value = v;
-
-      el.dispatchEvent(new Event('input',  {{ bubbles:true }}));
-      el.dispatchEvent(new Event('change', {{ bubbles:true }}));
-      el.blur();
-    }}
-
-    setInput(idEl, ID);
-    setInput(pwEl, PW);
-
-    return (idEl.value === ID) && (pwEl.value === PW);
+  function getIp() {{
+    const header = document.querySelector('#pop_header');
+    if (!header) return '';
+    const t = (header.innerText || '').trim();
+    const m = t.match(/\(([^)]+)\)/);
+    return m ? m[1].trim() : '';
   }}
 
+  function setInput(el, v) {{
+    const setVal = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    el.focus();
+    if (setVal) setVal.call(el, v);
+    else el.value = v;
+    el.dispatchEvent(new Event('input',  {{ bubbles:true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles:true }}));
+    el.blur();
+  }}
+
+  function tryFill() {{
+    const ip = getIp();
+    if (!ip) return false;
+
+    const cred = MAP[ip];
+    if (!cred) return false;
+
+    const idEl = document.querySelector('input#userid.txt_box2, input#userid, input[name=""userid""]');
+    const pwEl = document.querySelector('input#passwd.txt_box2, input#passwd, input[name=""passwd""]');
+    if (!idEl || !pwEl) return false;
+
+    setInput(idEl, cred.id || '');
+    setInput(pwEl, cred.pw || '');
+    return true;
+  }}
+
+  // ✅ DOM이 늦게 생성될 수 있으니 polling (최대 15초)
   let n = 0;
   const t = setInterval(() => {{
     n++;
-    if (tryFill() || n >= 40) clearInterval(t); // 최대 10초
+    if (tryFill() || n >= 60) clearInterval(t);
   }}, 250);
 }})();";
-
-    await _web.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(js);
 }
+
+
+
+
+이 방식이 “URL 매번 달라도” 되는 이유
+
+
+
+
+URL로 필터링 안 함
+
+
+“팝업 WebView 인스턴스”에만 스크립트를 주입하니까, 그 팝업에서 열리는 어떤 문서든 자동으로 실행됨
+
+
+
+
+
+원하면 다음 단계로,
+
+
+
+
+IP가 매칭 안 되는 경우를 대비해서 헤더 텍스트 전체를 로그로 뽑아오는 진단용 JS도 같이 달아줄게. (지금은 진단 빼고 바로 동작 위주로 짰음)
+
+
+
