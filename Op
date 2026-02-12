@@ -1,164 +1,29 @@
-ㅇㅇ 그거면 원인 100% 맞아. 첫 화면이 “안전하지 않음(인증서 경고 interstitial)” 페이지라서, 네가 넣은 selector(user ID, PASSWD)가 아예 존재하지 않으니 당연히 Fill이 안 먹는 거야.
-
-
-해결은 간단하게 2단계로 하면 됨:
-
-
-
-
-경고 페이지면 “계속(Proceed)”만 눌러주고
-
-
-진짜 로그인 페이지가 뜨면 ID/PW 채우기
-
-
-
-
-아래는 추가할 부분만.
-
-
-
-1) PopupBrowserForm에 “경고페이지 처리 + 로그인 입력” 한 방 폴링 함수 추가
-
-
-private async Task AutoHandleCertThenFillAsync(string id, string pw)
+private static async Task<bool> TryClickProceedUnsafeAsync(WebView2 web)
 {
-    for (int i = 0; i < 60; i++) // 최대 60회 * 200ms = 12초
-    {
-        // 1) 인증서 경고 interstitial이면 "계속" 버튼 누르기 시도
-        var didProceed = await TryClickProceedUnsafeAsync();
-        if (didProceed)
-        {
-            await Task.Delay(300); // 화면 전환 약간 기다림
-            continue;
-        }
-
-        // 2) 로그인 input이 뜨면 채우고 종료
-        var filled = await TryFillLoginOnceAsync(id, pw);
-        if (filled) return;
-
-        await Task.Delay(200);
-    }
-}
-
-
-
-
-2) “Proceed(안전하지 않음 → 계속)” 클릭 시도 함수 추가
-
-
-Chrome 계열 interstitial은 보통 id가 details-button, proceed-link 이런 식이라서 아래처럼 잡으면 꽤 잘 잡힘.
-
-
-private async Task<bool> TryClickProceedUnsafeAsync()
-{
-    var js = @"
+    const string js = @"
 (() => {
-  // Chromium SSL interstitial common ids
-  const details = document.querySelector('#details-button');
-  if (details) { details.click(); return true; }
-
+  // WebView2/Chromium SSL interstitial에서 자주 보이는 메인 프레임 id
+  // (환경 따라 다를 수 있어도 플래그는 안전하게 동작)
   const proceed = document.querySelector('#proceed-link');
-  if (proceed) { proceed.click(); return true; }
+  if (proceed) { proceed.click(); return 'proceeded'; }
 
-  // 혹시 버튼/링크 텍스트로도 한번 더
-  const byText = Array.from(document.querySelectorAll('button,a'))
-    .find(x => (x.innerText || '').includes('Proceed') || (x.innerText || '').includes('계속'));
-  if (byText) { byText.click(); return true; }
+  // details는 토글이므로 '한 번만' 누르게
+  if (!window.__gateone_details_clicked) {
+    const details = document.querySelector('#details-button');
+    if (details) {
+      window.__gateone_details_clicked = true;
+      details.click();
+      return 'details_clicked_once';
+    }
+  }
 
-  return false;
+  return 'no_action';
 })();";
 
-    var raw = await WebView.CoreWebView2.ExecuteScriptAsync(js);
-    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
+    var raw = await web.CoreWebView2.ExecuteScriptAsync(js);
+
+    // raw는 JSON string로 오기도 함: "\"proceeded\"" 이런 형태
+    // 그냥 contains로 처리
+    return raw.Contains("proceeded", StringComparison.OrdinalIgnoreCase)
+        || raw.Contains("details_clicked_once", StringComparison.OrdinalIgnoreCase);
 }
-
-
-
-
-3) 로그인 input “한 번만 시도” 함수 추가 (너 셀렉터 그대로)
-
-
-private async Task<bool> TryFillLoginOnceAsync(string id, string pw)
-{
-    var idJson = System.Text.Json.JsonSerializer.Serialize(id);
-    var pwJson = System.Text.Json.JsonSerializer.Serialize(pw);
-
-    var js = $@"
-(() => {{
-  const idEl = document.querySelector('input.input_txt[type=""text""][name=""user-defined""][id=""user ID""]');
-  const pwEl = document.querySelector('input.input_txt[type=""password""][name=""PASSWD""][id=""PASSWD""]');
-  if (!idEl || !pwEl) return false;
-
-  idEl.focus();
-  idEl.value = {idJson};
-  idEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
-  idEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
-
-  pwEl.focus();
-  pwEl.value = {pwJson};
-  pwEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
-  pwEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
-
-  return true;
-}})();
-";
-    var raw = await WebView.CoreWebView2.ExecuteScriptAsync(js);
-    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
-}
-
-
-
-
-4) EnsureInitializedAsync의 DOMContentLoaded에서 “기존 Fill” 대신 이거 호출로 교체
-
-
-기존에 FillLoginInputsAsync(...) 호출하던 부분을 이걸로 바꿔:
-
-
-WebView.CoreWebView2.DOMContentLoaded += async (s, e) =>
-{
-    try
-    {
-        if (string.IsNullOrWhiteSpace(_autoId) || string.IsNullOrWhiteSpace(_autoPw))
-            return;
-
-        await AutoHandleCertThenFillAsync(_autoId!, _autoPw!);
-    }
-    catch { }
-};
-
-
-
-
-로그인 버튼은?
-
-
-네가 말한 것처럼 값만 넣는 게 안전이 맞아. (특히 interstitial→리다이렉트가 섞이면 자동 클릭은 사고 남)
-그래도 나중에 옵션으로 버튼 클릭 붙이고 싶으면 TryFillLoginOnceAsync에서 마지막에 버튼 클릭 한 줄만 추가하면 됨.
-
-
-
-추가로, 제일 안정적인 방법(참고)
-
-
-WebView2는 환경 옵션으로 인증서 오류 무시를 “정식으로” 켜는 건 제한적이라, 지금처럼 DOM에서 proceed를 눌러주는 방식이 현실적으로 제일 잘 먹혀.
-
-
-
-지금 네 “안전하지 않음” 화면에서 실제로 뜨는 버튼 텍스트가
-
-
-
-
-“고급(Advanced)”
-
-
-“(안전하지 않음) 계속(Proceed)”
-이런 구조면 위 코드가 그대로 먹을 확률이 높아.
-
-
-
-
-혹시 안 먹으면, 그 경고 페이지에서 버튼 element id만 한 번 알려줘(개발자도구 말고도 JS로 document.body.innerHTML 일부 찍어도 됨). 그러면 selector를 딱 맞춰줄게.
-
