@@ -1,160 +1,109 @@
-맞아, 내가 너가 올린 코드 흐름(특히 PopupBrowserForm.EnsureInitializedAsync(env)가 이미 있고, NewWindowRequested에서 e.NewWindow = popup.WebView.CoreWebView2;로 연결하는 구조) 를 “그대로” 기준으로 추가 위치를 더 정확히 써줘야 했는데, 내가 설명을 너무 일반화해서 헷갈리게 만들었어. 지금부터는 너 코드에 ‘추가/수정’만 딱 집어서 줄게. (전체 재작성 없음)
+맞아. 내가 “어디서 읽어서 어떤 변수에 넣는지” 그 연결 코드를 안 줬네.
+
+지금 네 상황에서 “추가해야 하는 부분만” 딱 주면, 이렇게 하면 끝이야.
 
 
-아래 3군데만 하면 끝.
+아래는 MainForm에 추가할 최소 코드 3덩어리야.
 
 
 
-1) PopupBrowserForm에 필드 2개 + setter “추가”
+1) MainForm 필드 2개 추가 (팝업에 넘길 값 저장용)
 
 
-PopupBrowserForm 클래스 안(아무데나 필드 영역)에 추가:
+MainForm 클래스 필드 쪽에 추가:
 
 
-private string? _autoId;
-private string? _autoPw;
-
-public void SetAutoCredentials(string id, string pw)
-{
-    _autoId = id;
-    _autoPw = pw;
-}
+private string? _loginIdFromJson;
+private string? _loginPwFromJson;
 
 
 
 
-2) PopupBrowserForm.EnsureInitializedAsync(...) 안에 DOMContentLoaded “추가”
+2) device_map.json에서 credentials 읽는 함수 추가 (MainForm 안에)
 
 
-너 코드:
-
-
-public async Task EnsureInitializedAsync(Microsoft.Web.WebView2.Core.CoreWebView2Environment env)
-{
-    await WebView.EnsureCoreWebView2Async(env);
-    WebView.CoreWebView2.WindowCloseRequested += (s, e) => { BeginInvoke(new Action(Close)); };
-}
-
-
-
-여기 WindowCloseRequested 아래에 그대로 추가:
-
-
-WebView.CoreWebView2.DOMContentLoaded += async (s, e) =>
+private (string? id, string? pw) LoadCredentialsFromMap(string mapPath)
 {
     try
     {
-        if (string.IsNullOrWhiteSpace(_autoId) || string.IsNullOrWhiteSpace(_autoPw))
-            return;
+        using var doc = JsonDocument.Parse(File.ReadAllText(mapPath));
+        if (!doc.RootElement.TryGetProperty("credentials", out var cred))
+            return (null, null);
 
-        // ✅ 값만 넣기(로그인 클릭은 기본 false)
-        await FillLoginInputsAsync(_autoId!, _autoPw!, autoClick: false);
+        string? id = cred.TryGetProperty("id", out var pid) ? pid.GetString() : null;
+        string? pw = cred.TryGetProperty("pw", out var ppw) ? ppw.GetString() : null;
+
+        return (id, pw);
     }
     catch
     {
-        // 무시
+        return (null, null);
     }
-};
-
-
-
-
-3) PopupBrowserForm에 Fill 함수 “추가”
-
-
-PopupBrowserForm 클래스 안에 메서드로 추가:
-
-
-private async Task FillLoginInputsAsync(string id, string pw, bool autoClick)
-{
-    var idJson = System.Text.Json.JsonSerializer.Serialize(id);
-    var pwJson = System.Text.Json.JsonSerializer.Serialize(pw);
-
-    // ✅ 너가 준 셀렉터를 그대로 사용
-    var js = $@"
-(() => {{
-  const idEl = document.querySelector('input.input_txt[type=""text""][name=""user-defined""][id=""user ID""]');
-  const pwEl = document.querySelector('input.input_txt[type=""password""][name=""PASSWD""][id=""PASSWD""]');
-
-  if (!idEl || !pwEl) return 'no-input';
-
-  idEl.value = {idJson};
-  idEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
-  idEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
-
-  pwEl.value = {pwJson};
-  pwEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
-  pwEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
-
-  if ({(autoClick ? "true" : "false")}) {{
-    // 로그인 버튼은 너가 원하면 나중에 정확 셀렉터로 교체
-    const btn = document.querySelector('button[type=""submit""], input[type=""submit""]');
-    if (btn) btn.click();
-  }}
-
-  return 'filled';
-}})();
-";
-    await WebView.CoreWebView2.ExecuteScriptAsync(js);
 }
 
 
 
 
 
-여기서 id="user ID" 공백 포함인 거 그대로 처리했어. (이게 중요)
+전제: device_map.json 최상위에 아래처럼 넣어둬야 함
+
+"credentials": { "id": "...", "pw": "..." }
 
 
 
 
 
-4) 마지막: MainForm.CoreWebView2_NewWindowRequested에서 credentials 주입 “1줄 추가”
+3) ReloadMap()에서 “기존 로드 + credentials 로드” 연결 (여기가 너가 말한 ‘json 가져올 때 여기에 넣어야’ 부분)
 
 
-너 코드 흐름에서:
+너 ReloadMap() 맨 마지막( _index = DeviceIndex.Load(MapPath); 바로 아래) 에 이 3줄만 추가:
 
 
-var popup = new PopupBrowserForm();
-await popup.EnsureInitializedAsync(_web.CoreWebView2.Environment);
-e.NewWindow = popup.WebView.CoreWebView2;
-popup.Show(this);
+var (id, pw) = LoadCredentialsFromMap(MapPath);
+_loginIdFromJson = id;
+_loginPwFromJson = pw;
 
 
 
-여기서 EnsureInitializedAsync 호출 전에 딱 1줄 추가:
+최종적으로 ReloadMap 일부가 이렇게 되는 느낌:
 
 
-var popup = new PopupBrowserForm();
+_index = DeviceIndex.Load(MapPath);
 
-// ✅ 여기: JSON에서 읽은 값 넣기
-popup.SetAutoCredentials(loginIdFromJson, loginPwFromJson);
-
-await popup.EnsureInitializedAsync(_web.CoreWebView2.Environment);
-e.NewWindow = popup.WebView.CoreWebView2;
-popup.Show(this);
+var (id, pw) = LoadCredentialsFromMap(MapPath);
+_loginIdFromJson = id;
+_loginPwFromJson = pw;
 
 
 
 
-“로그인 버튼 클릭”은?
+4) (중요) 팝업 만들 때 SetAutoCredentials 호출 추가
 
 
-너 말대로 2차 인증이 있고 안전하게 가려면 기본은 값만 넣기(autoClick:false) 가 맞아.
-나중에 버튼 셀렉터만 정확히 주면 autoClick:true로만 바꾸면 됨.
+너 CoreWebView2_NewWindowRequested 안에서 popup 만든 직후에 딱 이거:
 
 
-
-원하는 “추가 코드만”은 여기까지가 끝.
-
-
-만약 지금도 “안 들어간다”면, 그건 거의 100%:
+if (!string.IsNullOrWhiteSpace(_loginIdFromJson) && !string.IsNullOrWhiteSpace(_loginPwFromJson))
+    popup.SetAutoCredentials(_loginIdFromJson!, _loginPwFromJson!);
 
 
 
 
-팝업 페이지가 DOMContentLoaded 때 아직 로그인 폼을 렌더링 안 한 케이스라서 그래.
-
-그땐 DOMContentLoaded 안에서 FillLoginInputsAsync를 몇 번 재시도(200ms 간격 10~20회) 하게만 추가하면 해결됨. (이것도 추가코드 아주 짧게 해줄게)
+정리
 
 
+
+
+“json 가져올 때 값을 여기에 넣어야” = ReloadMap()에서 _loginIdFromJson/_loginPwFromJson에 넣는 게 제일 자연스러움 (map 파일을 여기서 읽으니까)
+
+
+에러났던 loginIdFromJson 같은 건 변수 자체가 없어서 나는 거고, 위처럼 필드로 만들고 ReloadMap에서 채우면 해결
+
+
+
+
+
+원하면 내가 네 device_map.json 기본 생성 코드도 살짝 수정해줄게.
+
+지금 너 코드가 파일 없으면 자동 생성하잖아? 거기에 credentials 기본 템플릿까지 같이 넣게 하면 “항상 키가 존재”해서 더 편해짐.
 
