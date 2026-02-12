@@ -1,63 +1,45 @@
-private static async Task<bool> TryFillLoginOnceAsync(WebView2 web, string id, string pw)
+private async Task RegisterAutoLoginScriptAsync()
 {
-    var idJson = JsonSerializer.Serialize(id);
-    var pwJson = JsonSerializer.Serialize(pw);
+    if (_web.CoreWebView2 == null) return;
+    if (string.IsNullOrWhiteSpace(_loginIdFromJson) || string.IsNullOrWhiteSpace(_loginPwFromJson)) return;
+
+    var idJson = JsonSerializer.Serialize(_loginIdFromJson);
+    var pwJson = JsonSerializer.Serialize(_loginPwFromJson);
 
     var js = $@"
 (() => {{
   const ID = {idJson};
   const PW = {pwJson};
 
-  function findInDoc(doc) {{
-    if (!doc) return null;
+  function tryFill() {{
+    const idEl = document.querySelector('input#USERID.input_txt, input#USERID, input[name=""USERID""]');
+    const pwEl = document.querySelector('input#PASSWD.input_txt, input#PASSWD, input[name=""PASSWD""]');
+    if (!idEl || !pwEl) return false;
 
-    const idEl = doc.querySelector('input#USERID.input_txt, input#USERID, input[name=""USERID""], input[name=""userid""]');
-    const pwEl = doc.querySelector('input#PASSWD.input_txt, input#PASSWD, input[type=""password""][name=""PASSWD""], input[name=""password""]');
+    const setVal = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
 
-    if (idEl && pwEl) return {{ idEl, pwEl }};
-    return null;
-  }}
+    function setInput(el, v) {{
+      el.focus();
+      if (setVal) setVal.call(el, v);
+      else el.value = v;
 
-  // 메인 문서에서 먼저 찾고
-  let found = findInDoc(document);
-
-  // 없으면 iframe들에서도 찾아보기 (동일 출처일 때만 접근됨)
-  if (!found) {{
-    const frames = Array.from(document.querySelectorAll('iframe'));
-    for (const f of frames) {{
-      try {{
-        const d = f.contentDocument || (f.contentWindow && f.contentWindow.document);
-        found = findInDoc(d);
-        if (found) break;
-      }} catch (e) {{
-        // cross-origin이면 접근 불가 -> 무시
-      }}
+      el.dispatchEvent(new Event('input',  {{ bubbles:true }}));
+      el.dispatchEvent(new Event('change', {{ bubbles:true }}));
+      el.blur();
     }}
+
+    setInput(idEl, ID);
+    setInput(pwEl, PW);
+
+    return (idEl.value === ID) && (pwEl.value === PW);
   }}
 
-  if (!found) return false;
-
-  const {{ idEl, pwEl }} = found;
-
-  // ✅ native setter로 값 주입 (프레임워크가 value set을 감지하는 경우 대응)
-  const setVal = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-
-  function apply(el, v) {{
-    el.focus();
-    if (setVal) setVal.call(el, v);
-    else el.value = v;
-
-    el.dispatchEvent(new Event('input',  {{ bubbles:true }}));
-    el.dispatchEvent(new Event('change', {{ bubbles:true }}));
-    el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles:true, key:'Enter' }}));
-  }}
-
-  apply(idEl, ID);
-  apply(pwEl, PW);
-
-  return true;
+  let n = 0;
+  const t = setInterval(() => {{
+    n++;
+    if (tryFill() || n >= 40) clearInterval(t); // 최대 10초
+  }}, 250);
 }})();";
 
-    var raw = await web.CoreWebView2.ExecuteScriptAsync(js);
-    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
+    await _web.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(js);
 }
