@@ -1,621 +1,160 @@
-좋아요! 지금까지 대화에서 합의/개선한 내용들을 한 번에 반영한 통합 업데이트(vNEXT) 패치로 정리해 드릴게요.
-
-핵심은:
+맞아, 내가 너가 올린 코드 흐름(특히 PopupBrowserForm.EnsureInitializedAsync(env)가 이미 있고, NewWindowRequested에서 e.NewWindow = popup.WebView.CoreWebView2;로 연결하는 구조) 를 “그대로” 기준으로 추가 위치를 더 정확히 써줘야 했는데, 내가 설명을 너무 일반화해서 헷갈리게 만들었어. 지금부터는 너 코드에 ‘추가/수정’만 딱 집어서 줄게. (전체 재작성 없음)
 
 
-
-
-Success 블록을 한 번만 스캔해서 (키→인덱스→값) 인덱스 생성 → 빠르고 프리징 최소화
-
-
-LOT은 End 시점 1회 조회로 채움 (기본 우선순위: OUT_LOTID → INPUT_LOTID → INPUT_CSTID, 인덱스 0..n 중 첫 비어있지 않은 값)
-
-
-table.json에서 비즈명→추가키 목록을 로드 → 검색어 BR_...에 따라 LOT 옆에 동적 컬럼(KEY[0..n]) 자동 생성
-
-
-LOT/동적 컬럼 헤더 정렬 지원
-
-
-상세 팝업 편집 가능(저장 없음, 복사용)
+아래 3군데만 하면 끝.
 
 
 
-
-아래 코드는 교체/추가용 패치로 그대로 넣으시면 됩니다.
-
+1) PopupBrowserForm에 필드 2개 + setter “추가”
 
 
-0) table.json 예시 (반드시 이 포맷)
+PopupBrowserForm 클래스 안(아무데나 필드 영역)에 추가:
 
 
+private string? _autoId;
+private string? _autoPw;
+
+public void SetAutoCredentials(string id, string pw)
 {
-  "BR_1": ["PV"],
-  "BR_2": ["SV", "ID"],
-  "BR_3": ["ABC","BBC"],
-  "BR_4": ["CCN"]
+    _autoId = id;
+    _autoPw = pw;
 }
 
 
 
 
-1) 클래스 필드(상단에 추가/교체)
+2) PopupBrowserForm.EnsureInitializedAsync(...) 안에 DOMContentLoaded “추가”
 
 
-// ==== 성공 블록 인덱스 ====
-// 파일 → Success헤더Idx → (키 → (인덱스 → 값))
-private readonly Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<int, string>>>> kvIndexByFile
-    = new Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<int, string>>>>(StringComparer.OrdinalIgnoreCase);
+너 코드:
 
-// table.json 로드 결과: 비즈명 → 추가 표시할 키 목록
-private Dictionary<string, string[]> extraKeyRules 
-    = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
-// 현재 동적 컬럼 이름들(제거용)
-private readonly List<string> currentDynamicCols = new List<string>();
-
-// LOT 후보 키(기본 우선순위)
-private static readonly string[] defaultLotKeys = new[] { "OUT_LOTID", "INPUT_LOTID", "INPUT_CSTID" };
-
-// 정렬 상태
-private string _mergedLastSortCol = null;
-private bool _mergedLastSortAsc = true;
+public async Task EnsureInitializedAsync(Microsoft.Web.WebView2.Core.CoreWebView2Environment env)
+{
+    await WebView.EnsureCoreWebView2Async(env);
+    WebView.CoreWebView2.WindowCloseRequested += (s, e) => { BeginInvoke(new Action(Close)); };
+}
 
 
 
+여기 WindowCloseRequested 아래에 그대로 추가:
 
 
-CombinedRow에 아래 속성이 있어야 합니다(없으면 추가):
-
-
-
-
-public int SuccessIdx { get; set; } = -1;
-public string MLot { get; set; }
-
-
-
-
-2) table.json 로드 (프로그램 시작 1회)
-
-
-private void LoadExtraKeyRules()
+WebView.CoreWebView2.DOMContentLoaded += async (s, e) =>
 {
     try
     {
-        string jsonPath = Path.Combine(Application.StartupPath, "table.json");
-        if (!File.Exists(jsonPath))
-        {
-            MessageBox.Show("table.json 파일을 찾을 수 없습니다.", "알림",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            extraKeyRules = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(_autoId) || string.IsNullOrWhiteSpace(_autoPw))
             return;
-        }
 
-        string json = File.ReadAllText(jsonPath, Encoding.UTF8);
-        extraKeyRules = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string[]>>(json,
-            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-            ?? new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        // ✅ 값만 넣기(로그인 클릭은 기본 false)
+        await FillLoginInputsAsync(_autoId!, _autoPw!, autoClick: false);
     }
-    catch (Exception ex)
+    catch
     {
-        MessageBox.Show("table.json 로딩 실패\n" + ex.Message, "오류",
-            MessageBoxButtons.OK, MessageBoxIcon.Error);
-        extraKeyRules = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        // 무시
     }
-}
+};
 
 
 
 
-
-생성자 또는 Form_Load 초기에 호출:
-
+3) PopupBrowserForm에 Fill 함수 “추가”
 
 
+PopupBrowserForm 클래스 안에 메서드로 추가:
 
-public MainForm()
+
+private async Task FillLoginInputsAsync(string id, string pw, bool autoClick)
 {
-    InitializeComponent();
-    LoadExtraKeyRules();                 // ★ table.json 로드
-    gridMerged.CellFormatting += gridMerged_CellFormatting;
-    gridMerged.ColumnHeaderMouseClick += gridMerged_ColumnHeaderMouseClick;
-}
+    var idJson = System.Text.Json.JsonSerializer.Serialize(id);
+    var pwJson = System.Text.Json.JsonSerializer.Serialize(pw);
 
+    // ✅ 너가 준 셀렉터를 그대로 사용
+    var js = $@"
+(() => {{
+  const idEl = document.querySelector('input.input_txt[type=""text""][name=""user-defined""][id=""user ID""]');
+  const pwEl = document.querySelector('input.input_txt[type=""password""][name=""PASSWD""][id=""PASSWD""]');
 
+  if (!idEl || !pwEl) return 'no-input';
 
+  idEl.value = {idJson};
+  idEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
+  idEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
 
-3) 유틸: 헤더에서 Var 추출(기존 규칙 그대로)
+  pwEl.value = {pwJson};
+  pwEl.dispatchEvent(new Event('input', {{ bubbles:true }}));
+  pwEl.dispatchEvent(new Event('change', {{ bubbles:true }}));
 
+  if ({(autoClick ? "true" : "false")}) {{
+    // 로그인 버튼은 너가 원하면 나중에 정확 셀렉터로 교체
+    const btn = document.querySelector('button[type=""submit""], input[type=""submit""]');
+    if (btn) btn.click();
+  }}
 
-// [..][..] 토큰에서 Var(두번째 토큰) 추출
-private string GetVarFromHeader(string sourceFile, string rest)
-{
-    var tokens = new List<string>();
-    string tmp = rest ?? "";
-    int guard = 0;
-    while (guard++ < 8)
-    {
-        var m = bracketRx.Match(tmp); // ^\[(?<tok>[^\]]+)\]\s*
-        if (!m.Success) break;
-        tokens.Add(m.Groups["tok"].Value);
-        tmp = tmp.Substring(m.Length);
-    }
-
-    string device = null, varName = null;
-    if (tokens.Count >= 2) { device = tokens[0]; varName = tokens[1]; }
-    else if (tokens.Count == 1) { varName = tokens[0]; }
-
-    if (string.IsNullOrEmpty(device))
-    {
-        var n = Path.GetFileNameWithoutExtension(sourceFile);
-        var cut = n.LastIndexOf('_');
-        device = cut > 0 ? n.Substring(0, cut) : n;
-    }
-    if (string.IsNullOrEmpty(varName)) varName = device ?? "GLOBAL";
-    return varName;
-}
-
-
-
-
-4) 성공 블록 파서: (키→인덱스→값) 수집
-
-
-// Success 블록에서 모든 [idx:KEY] : VALUE 수집 → KEY → (idx → value)
-private Dictionary<string, Dictionary<int, string>> ParseSuccessBlockPairsWithIndex(string blockText)
-{
-    var dict = new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
-    using (var reader = new StringReader(blockText ?? ""))
-    {
-        string line;
-        while ((line = reader.ReadLine()) != null)
-        {
-            var m = Regex.Match(line, @"^\s*\[\s*(\d+)\s*:\s*([A-Za-z0-9_]+)\s*\]\s*:\s*(.*)\s*$");
-            if (!m.Success) continue;
-
-            int idx = int.Parse(m.Groups[1].Value);
-            string key = m.Groups[2].Value.Trim();
-            string val = (m.Groups[3].Value ?? "").Trim();
-
-            if (!dict.TryGetValue(key, out var byIndex))
-            {
-                byIndex = new Dictionary<int, string>();
-                dict[key] = byIndex;
-            }
-            byIndex[idx] = val; // 같은 인덱스는 마지막 값으로 갱신
-        }
-    }
-    return dict;
-}
-
-
-
-
-5) 파일 1회 스캔: KV 인덱스 생성
-
-
-private void BuildSuccessKVIndexForFile(string fullPath)
-{
-    var source = Path.GetFileName(fullPath);
-    var map = new Dictionary<int, Dictionary<string, Dictionary<int, string>>>(); // SuccessIdx → key→(idx→val)
-
-    long idx = 0;
-    int currentHeaderIdx = -1;
-    bool inSuccessBlock = false;
-    var sbBlock = new StringBuilder(1024);
-    string currentVarName = null;
-
-    using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
-    {
-        string line;
-        while ((line = sr.ReadLine()) != null)
-        {
-            var m = headRx.Match(line); // ^(?<dt>...) \[(?<level>...)\] (?<rest>.*)$
-            if (m.Success)
-            {
-                // 이전 Success 블록 flush
-                if (inSuccessBlock && currentHeaderIdx >= 0)
-                {
-                    var pairs = ParseSuccessBlockPairsWithIndex(sbBlock.ToString());
-                    map[currentHeaderIdx] = pairs; // 비어있어도 저장
-                }
-
-                // 새 헤더 준비
-                currentHeaderIdx = (int)idx;
-                sbBlock.Clear();
-                var rest = m.Groups["rest"].Value;
-                inSuccessBlock = (DetectKind(rest) == ActionKind.Success);
-                currentVarName = GetVarFromHeader(source, rest);
-            }
-            else
-            {
-                if (inSuccessBlock) sbBlock.AppendLine(line);
-            }
-            idx++;
-        }
-    }
-
-    // 파일 끝에서도 flush
-    if (inSuccessBlock && currentHeaderIdx >= 0)
-    {
-        var pairs = ParseSuccessBlockPairsWithIndex(sbBlock.ToString());
-        map[currentHeaderIdx] = pairs;
-    }
-
-    lock (locker) { kvIndexByFile[source] = map; }
+  return 'filled';
+}})();
+";
+    await WebView.CoreWebView2.ExecuteScriptAsync(js);
 }
 
 
 
 
 
-파일 로드시 반드시 호출:
+여기서 id="user ID" 공백 포함인 거 그대로 처리했어. (이게 중요)
 
 
 
 
-private async Task LoadOneFileAsync(string file)
-{
-    SetBusy("파일 읽는 중…", true);
-    try
-    {
-        lock (locker) { rows.Clear(); kvIndexByFile.Clear(); }
-        await Task.Run(async () => { await ParseFileAsync(file); });
-        await Task.Run(() => BuildSuccessKVIndexForFile(file));     // ★ 인덱스 1회 생성
-        ApplyFilterAndBind();
-        UpdateDynamicColumnsForSearch();                            // ★ 동적 컬럼 반영
-        statusLabel.Text = $"완료: {Path.GetFileName(file)}  라인 {rows.Count}";
-    }
-    catch (Exception ex)
-    {
-        statusLabel.Text = "오류 발생";
-        MessageBox.Show(ex.ToString(), "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
-    }
-    finally
-    {
-        SetBusy(statusLabel.Text, false);
-    }
-}
 
+4) 마지막: MainForm.CoreWebView2_NewWindowRequested에서 credentials 주입 “1줄 추가”
 
 
+너 코드 흐름에서:
 
-6) LOT 채우기(세션 닫힐 때 1회 조회)
 
+var popup = new PopupBrowserForm();
+await popup.EnsureInitializedAsync(_web.CoreWebView2.Environment);
+e.NewWindow = popup.WebView.CoreWebView2;
+popup.Show(this);
 
-// LOT 후보키에서 인덱스 0..n 중 첫 비어있지 않은 값 선택
-private string PickLotFromPairs(string varName, Dictionary<string, Dictionary<int, string>> pairs)
-{
-    if (pairs == null || pairs.Count == 0) return string.Empty;
 
-    foreach (var k in defaultLotKeys)
-    {
-        if (!pairs.TryGetValue(k, out var byIndex) || byIndex == null || byIndex.Count == 0)
-            continue;
 
-        int maxIdx = byIndex.Keys.Count > 0 ? byIndex.Keys.Max() : -1;
-        for (int i = 0; i <= maxIdx; i++)
-        {
-            if (byIndex.TryGetValue(i, out var v) && !string.IsNullOrWhiteSpace(v))
-                return v.Trim();
-        }
-    }
-    return string.Empty;
-}
+여기서 EnsureInitializedAsync 호출 전에 딱 1줄 추가:
 
 
+var popup = new PopupBrowserForm();
 
-BuildMergedQueue의 End 분기에서:
+// ✅ 여기: JSON에서 읽은 값 넣기
+popup.SetAutoCredentials(loginIdFromJson, loginPwFromJson);
 
+await popup.EnsureInitializedAsync(_web.CoreWebView2.Environment);
+e.NewWindow = popup.WebView.CoreWebView2;
+popup.Show(this);
 
-// LOT은 End에서 딱 한 번만 조회
-if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
-{
-    if (kvIndexByFile.TryGetValue(cur.SourceFile, out var fileMap) &&
-        fileMap.TryGetValue(cur.SuccessIdx, out var pairs))
-    {
-        cur.MLot = PickLotFromPairs(cur.Var, pairs);
-    }
-}
 
 
 
+“로그인 버튼 클릭”은?
 
 
-Success 분기에서는 cur.SuccessIdx = (int)r.LineIndex; 만 저장.
+너 말대로 2차 인증이 있고 안전하게 가려면 기본은 값만 넣기(autoClick:false) 가 맞아.
+나중에 버튼 셀렉터만 정확히 주면 autoClick:true로만 바꾸면 됨.
 
 
 
+원하는 “추가 코드만”은 여기까지가 끝.
 
 
-7) 동적 컬럼: 키의 최대 인덱스 0..n 자동 감지 → 컬럼 생성
+만약 지금도 “안 들어간다”면, 그건 거의 100%:
 
 
-private void UpdateDynamicColumnsForSearch()
-{
-    // 1) 기존 동적 컬럼 제거
-    foreach (var name in currentDynamicCols.ToList())
-        if (gridMerged.Columns.Contains(name)) gridMerged.Columns.Remove(name);
-    currentDynamicCols.Clear();
 
-    // 2) 검색어에서 첫 번째 BR_* 추출 (A|B|C 지원)
-    var raw = (txtSearchVar.Text ?? "").Trim();
-    if (string.IsNullOrEmpty(raw)) { gridMerged.Refresh(); return; }
-    var tokens = raw.Split('|').Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
-    var biz = tokens.FirstOrDefault(t => t.StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
-    if (string.IsNullOrEmpty(biz)) { gridMerged.Refresh(); return; }
 
-    // 3) table.json 규칙 조회
-    if (!extraKeyRules.TryGetValue(biz, out var keys) || keys == null || keys.Length == 0)
-    { gridMerged.Refresh(); return; }
+팝업 페이지가 DOMContentLoaded 때 아직 로그인 폼을 렌더링 안 한 케이스라서 그래.
 
-    // 4) 현재 mergedRows 범위에서 각 키의 최대 인덱스 계산
-    var maxIndexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-    foreach (var key in keys)
-    {
-        int maxIdx = -1;
-        foreach (var r in mergedRows)
-        {
-            if (r.SuccessIdx < 0) continue;
-            if (!kvIndexByFile.TryGetValue(r.SourceFile, out var fileMap)) continue;
-            if (!fileMap.TryGetValue(r.SuccessIdx, out var pairs)) continue;
-            if (!pairs.TryGetValue(key, out var byIndex) || byIndex == null || byIndex.Count == 0) continue;
-
-            int localMax = byIndex.Keys.Max();
-            if (localMax > maxIdx) maxIdx = localMax;
-        }
-        if (maxIdx >= 0) maxIndexByKey[key] = maxIdx;
-    }
-
-    if (maxIndexByKey.Count == 0) { gridMerged.Refresh(); return; }
-
-    // 5) LOT 옆에 삽입
-    int lotIdx = gridMerged.Columns.Cast<DataGridViewColumn>()
-                    .FirstOrDefault(c => c.DataPropertyName == "MLot")?.Index ?? -1;
-    int insertAt = (lotIdx >= 0) ? lotIdx + 1 : gridMerged.Columns.Count;
-
-    // 6) 키마다 0..maxIdx 컬럼 생성 (Tag=(key, idx))
-    foreach (var kv in maxIndexByKey)
-    {
-        string key = kv.Key;
-        int maxIdx = kv.Value;
-        for (int i = 0; i <= maxIdx; i++)
-        {
-            string colName = $"colExtra_{key}_{i}";
-            if (gridMerged.Columns.Contains(colName)) continue;
-
-            var col = new DataGridViewTextBoxColumn
-            {
-                Name = colName,
-                HeaderText = $"{key}[{i}]",
-                Width = 140,
-                SortMode = DataGridViewColumnSortMode.Programmatic,
-                Tag = (key, i)
-            };
-            gridMerged.Columns.Insert(insertAt++, col);
-            currentDynamicCols.Add(colName);
-        }
-    }
-
-    gridMerged.Refresh();
-}
-
-
-
-
-8) 동적 컬럼 값 채우기 (CellFormatting)
-
-
-private void gridMerged_CellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
-{
-    if (e.RowIndex < 0) return;
-    var col = gridMerged.Columns[e.ColumnIndex];
-    if (col == null) return;
+그땐 DOMContentLoaded 안에서 FillLoginInputsAsync를 몇 번 재시도(200ms 간격 10~20회) 하게만 추가하면 해결됨. (이것도 추가코드 아주 짧게 해줄게)
 
-    if (!col.Name.StartsWith("colExtra_", StringComparison.Ordinal)) return;
-
-    var row = gridMerged.Rows[e.RowIndex].DataBoundItem as CombinedRow;
-    if (row == null || row.SuccessIdx < 0) { e.Value = ""; e.FormattingApplied = true; return; }
-
-    if (!kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) ||
-        !fileMap.TryGetValue(row.SuccessIdx, out var pairs) ||
-        pairs == null) { e.Value = ""; e.FormattingApplied = true; return; }
-
-    (string key, int idx) = ((string, int))col.Tag;
-    if (pairs.TryGetValue(key, out var byIndex) &&
-        byIndex != null &&
-        byIndex.TryGetValue(idx, out var val) &&
-        !string.IsNullOrEmpty(val))
-    {
-        e.Value = val;
-    }
-    else e.Value = "";
-
-    e.FormattingApplied = true;
-}
-
-
-
-
-9) LOT/동적 컬럼 정렬 (헤더 클릭)
-
-
-private string GetMergedCellSortKey(CombinedRow row, DataGridViewColumn col)
-{
-    if (row == null || col == null) return string.Empty;
-
-    // LOT
-    if (col.DataPropertyName == "MLot" || col.Name.Equals("colLot", StringComparison.OrdinalIgnoreCase))
-        return row.MLot ?? string.Empty;
-
-    // 동적
-    if (col.Name.StartsWith("colExtra_", StringComparison.Ordinal))
-    {
-        if (!kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) ||
-            !fileMap.TryGetValue(row.SuccessIdx, out var pairs) ||
-            pairs == null) return string.Empty;
-
-        (string key, int idx) = ((string, int))col.Tag;
-        if (pairs.TryGetValue(key, out var byIndex) &&
-            byIndex != null &&
-            byIndex.TryGetValue(idx, out var val))
-            return val ?? string.Empty;
-
-        return string.Empty;
-    }
-
-    // 기본: DataPropertyName 문자열
-    var dp = col.DataPropertyName;
-    if (!string.IsNullOrEmpty(dp))
-    {
-        var prop = typeof(CombinedRow).GetProperty(dp);
-        if (prop != null)
-        {
-            var v = prop.GetValue(row);
-            return v?.ToString() ?? string.Empty;
-        }
-    }
-    return string.Empty;
-}
-
-private void gridMerged_ColumnHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
-{
-    if (e.ColumnIndex < 0 || e.ColumnIndex >= gridMerged.Columns.Count) return;
-    var col = gridMerged.Columns[e.ColumnIndex];
-
-    bool asc = true;
-    if (string.Equals(_mergedLastSortCol, col.Name, StringComparison.Ordinal))
-        asc = !_mergedLastSortAsc;
-    _mergedLastSortCol = col.Name;
-    _mergedLastSortAsc = asc;
-
-    Func<CombinedRow, string> keySel = r => GetMergedCellSortKey(r, col);
-
-    IOrderedEnumerable<CombinedRow> ordered;
-    if (asc)
-        ordered = mergedRows.OrderBy(keySel, StringComparer.OrdinalIgnoreCase).ThenBy(r => r.StartTs);
-    else
-        ordered = mergedRows.OrderByDescending(keySel, StringComparer.OrdinalIgnoreCase).ThenByDescending(r => r.StartTs);
-
-    mergedRows = ordered.ToList();
-    bsMerged.DataSource = null;
-    bsMerged.DataSource = mergedRows;
-    gridMerged.DataSource = bsMerged;
-}
-
-
-
-
-
-LOT/동적 컬럼 생성 시 SortMode = Programmatic 인지 확인하세요.
-
-
-
-
-
-10) 상세 팝업을 편집 가능으로 (복사용)
-
-
-private void ShowText(string text, string title)
-{
-    var frm = new Form { Text = title, Width = 1100, Height = 780, StartPosition = FormStartPosition.CenterParent };
-
-    var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(8, 6, 8, 6), AutoSize = false, WrapContents = false };
-    var chkWrap = new CheckBox { Text = "줄바꿈", AutoSize = true, Checked = false, Margin = new Padding(0, 6, 8, 0) };
-    var btnCopyAll = new Button { Text = "전체복사", Width = 80, Height = 24, Margin = new Padding(0, 2, 8, 0) };
-
-    var tb = new TextBox
-    {
-        Multiline = true,
-        Dock = DockStyle.Fill,
-        ScrollBars = ScrollBars.Both,
-        WordWrap = false,
-        ReadOnly = false,               // ★ 편집 가능
-        AcceptsReturn = true,
-        AcceptsTab = true,
-        ShortcutsEnabled = true,
-        Font = new Font("Consolas", 10),
-        Text = text
-    };
-
-    chkWrap.CheckedChanged += (s, e) =>
-    {
-        tb.WordWrap = chkWrap.Checked;
-        tb.ScrollBars = chkWrap.Checked ? ScrollBars.Vertical : ScrollBars.Both;
-    };
-    btnCopyAll.Click += (s, e) => { tb.SelectAll(); tb.Copy(); };
-
-    top.Controls.Add(chkWrap);
-    top.Controls.Add(btnCopyAll);
-    frm.Controls.Add(tb);
-    frm.Controls.Add(top);
-    frm.Show(this);
-}
-
-
-
-
-11) 검색 OR 지원 + 동적 컬럼 갱신 연결
-
-
-private IEnumerable<LogRow> FilterBySearch(IEnumerable<LogRow> source)
-{
-    var raw = (txtSearchVar.Text ?? "").Trim();
-    if (string.IsNullOrEmpty(raw)) return source;
-
-    var keys = raw.Split('|').Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
-    if (keys.Length == 0) return source;
-
-    return source.Where(r =>
-    {
-        var v = r.Var ?? "";
-        return keys.Any(k => v.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0);
-    });
-}
-
-private void ApplyFilterAndBind()
-{
-    IEnumerable<LogRow> q = rows;
-
-    if (chkBROnly.Checked)
-        q = q.Where(r => (r.Var ?? string.Empty).StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
-
-    q = FilterBySearch(q);
-    viewRows = q.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex).ToList();
-    BindLines(viewRows);
-
-    var forMerged = rows.AsEnumerable();
-    if (chkBROnly.Checked)
-        forMerged = forMerged.Where(r => (r.Var ?? "").StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
-    forMerged = FilterBySearch(forMerged);
-
-    mergedRows = BuildMergedQueue(forMerged.OrderBy(r => r.Timestamp).ThenBy(r => r.LineIndex)); // FIFO 방식
-    bsMerged.DataSource = mergedRows;
-    gridMerged.DataSource = bsMerged;
-
-    UpdateDynamicColumnsForSearch();   // ★ 검색어에 맞춰 동적 컬럼 갱신
-}
-
-
-
-
-
-검색창 Enter 시:
-
-
-
-
-txtSearchVar.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; btnSearch.PerformClick(); } };
-btnSearch.Click += (s, e) => { ApplyFilterAndBind(); };
-btnClear.Click  += (s, e) => { txtSearchVar.Text = ""; ApplyFilterAndBind(); };
-
-
-
-
-이걸로 table.json 기반 동적 컬럼(키 0..n 자동 감지), LOT 고정 + 정렬, 프리징 최소화, 편집 가능한 상세 팝업까지 전부 반영된 버전입니다.
-
-테스트하다가 특정 키만 다른 우선순위/표시명이 필요하면 table.json만 바꿔서 재실행하면 바로 적용돼요.
 
 
