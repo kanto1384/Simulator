@@ -1,29 +1,63 @@
-private static async Task<bool> TryClickProceedUnsafeAsync(WebView2 web)
+private static async Task<bool> TryFillLoginOnceAsync(WebView2 web, string id, string pw)
 {
-    const string js = @"
-(() => {
-  // WebView2/Chromium SSL interstitial에서 자주 보이는 메인 프레임 id
-  // (환경 따라 다를 수 있어도 플래그는 안전하게 동작)
-  const proceed = document.querySelector('#proceed-link');
-  if (proceed) { proceed.click(); return 'proceeded'; }
+    var idJson = JsonSerializer.Serialize(id);
+    var pwJson = JsonSerializer.Serialize(pw);
 
-  // details는 토글이므로 '한 번만' 누르게
-  if (!window.__gateone_details_clicked) {
-    const details = document.querySelector('#details-button');
-    if (details) {
-      window.__gateone_details_clicked = true;
-      details.click();
-      return 'details_clicked_once';
-    }
-  }
+    var js = $@"
+(() => {{
+  const ID = {idJson};
+  const PW = {pwJson};
 
-  return 'no_action';
-})();";
+  function findInDoc(doc) {{
+    if (!doc) return null;
+
+    const idEl = doc.querySelector('input#USERID.input_txt, input#USERID, input[name=""USERID""], input[name=""userid""]');
+    const pwEl = doc.querySelector('input#PASSWD.input_txt, input#PASSWD, input[type=""password""][name=""PASSWD""], input[name=""password""]');
+
+    if (idEl && pwEl) return {{ idEl, pwEl }};
+    return null;
+  }}
+
+  // 메인 문서에서 먼저 찾고
+  let found = findInDoc(document);
+
+  // 없으면 iframe들에서도 찾아보기 (동일 출처일 때만 접근됨)
+  if (!found) {{
+    const frames = Array.from(document.querySelectorAll('iframe'));
+    for (const f of frames) {{
+      try {{
+        const d = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+        found = findInDoc(d);
+        if (found) break;
+      }} catch (e) {{
+        // cross-origin이면 접근 불가 -> 무시
+      }}
+    }}
+  }}
+
+  if (!found) return false;
+
+  const {{ idEl, pwEl }} = found;
+
+  // ✅ native setter로 값 주입 (프레임워크가 value set을 감지하는 경우 대응)
+  const setVal = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+
+  function apply(el, v) {{
+    el.focus();
+    if (setVal) setVal.call(el, v);
+    else el.value = v;
+
+    el.dispatchEvent(new Event('input',  {{ bubbles:true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles:true }}));
+    el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles:true, key:'Enter' }}));
+  }}
+
+  apply(idEl, ID);
+  apply(pwEl, PW);
+
+  return true;
+}})();";
 
     var raw = await web.CoreWebView2.ExecuteScriptAsync(js);
-
-    // raw는 JSON string로 오기도 함: "\"proceeded\"" 이런 형태
-    // 그냥 contains로 처리
-    return raw.Contains("proceeded", StringComparison.OrdinalIgnoreCase)
-        || raw.Contains("details_clicked_once", StringComparison.OrdinalIgnoreCase);
+    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
 }
