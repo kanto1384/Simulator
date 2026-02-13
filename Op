@@ -1,60 +1,25 @@
-private async Task TryAutoFillOnceAsync()
-{
-    // var만 사용(ES5) + 즉시 실행 형태로 작성
-    // 1) #pop_header 에서 "(IP)" 추출
-    // 2) MAP[ip] 있으면
-    // 3) input#userid.txt_box2 / input#passwd.txt_box2 에 값 주입
-    var js = @"
-(function(){
-  try {
-    var MAP = " + _popupMapJson + @";
+function getIp() {
+  var header = document.querySelector('#pop_header');
+  if (!header) return '';
 
-    function getIp(){
-      var h = document.querySelector('#pop_header');
-      if(!h) return '';
-      var t = (h.innerText || '').trim();
-      var m = t.match(/\(([^)]+)\)/);
-      return m ? (m[1] || '').trim() : '';
-    }
+  var text = (header.innerText || '').trim();
+  if (!text) return '';
 
-    function qsAny(selectors){
-      for(var i=0;i<selectors.length;i++){
-        var el = document.querySelector(selectors[i]);
-        if(el) return el;
-      }
-      return null;
-    }
+  // IPv4 패턴 전체 매치
+  var matches = text.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g);
+  if (!matches || matches.length === 0) return '';
 
-    function setInput(el, v){
-      try{
-        el.focus();
-        var setVal = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');
-        if(setVal && setVal.set) setVal.set.call(el, v);
-        else el.value = v;
-        el.dispatchEvent(new Event('input',  { bubbles:true }));
-        el.dispatchEvent(new Event('change', { bubbles:true }));
-        el.blur();
-      }catch(_){}
-    }
+  // 마지막 매치 사용
+  var ip = matches[matches.length - 1];
 
-    var ip = getIp();
-    if(!ip) return 'NO_IP';
+  // 0~255 범위 간단 체크
+  var parts = ip.split('.');
+  if (parts.length !== 4) return '';
 
-    var cred = MAP[ip];
-    if(!cred) return 'NO_MATCH:' + ip;
-
-    var idEl = qsAny(['input#userid.txt_box2','input#userid','input[name=""userid""]']);
-    var pwEl = qsAny(['input#passwd.txt_box2','input#passwd','input[name=""passwd""]']);
-    if(!idEl || !pwEl) return 'NO_INPUT';
-
-    setInput(idEl, cred.id || '');
-    setInput(pwEl, cred.pw || '');
-
-    return 'OK:' + ip;
-  } catch(e){
-    return 'ERR:' + (e && e.message ? e.message : 'unknown');
+  for (var i = 0; i < 4; i++) {
+    var n = parseInt(parts[i], 10);
+    if (isNaN(n) || n < 0 || n > 255) return '';
   }
-})();";
 
-    await WebView.CoreWebView2.ExecuteScriptAsync(js);
+  return ip;
 }
