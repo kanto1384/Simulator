@@ -1,128 +1,92 @@
-아래는 “코드만” 기준으로, 현재 구조(왼쪽 TreeView + 오른쪽 DataGridView)에서 배열(JArray) 선택 시 ‘추가(Add)’ 버튼을 조건부 활성화하고, 버튼을 누르면 배열에 새 항목(JObject)을 템플릿 형태로 추가하는 핵심 구현입니다.
+아래 코드는 “이전 대화에서 말한 요구사항(배열 선택 시 Add 버튼 활성화 + 특정 배열은 Ip/Id/Info/Password/Note 템플릿 추가)”만 가볍게 넣은 형태입니다.
+
+(업로드 없이도 적용 가능하도록 Path 기준으로 동작하게 했습니다.)
 
 
-요구사항 해석(코드로 반영):
-
-
-
-
-왼쪽 트리에서 [] 형태의 배열 노드(JArray) 를 선택하면
+0) 전제
 
 
 
-그 배열이 “추가 지원 대상”인지(배열 이름/경로/스키마 매칭) 검사
+
+왼쪽 TreeView 노드의 Tag에 JToken이 들어있어야 함 (AddNode()에서 node.Tag = token;)
 
 
-맞으면 Add 버튼 활성화
-
+배열 노드를 클릭하면 JArray가 선택됨
 
 
 
 
 
-Add 버튼 클릭 시
+1) 필드/설정 추가 (JsonEditorForm 클래스 맨 위)
 
 
-
-일반 배열: “키:값”만 가진 기본 오브젝트 추가
-
-
-특정 배열: 아래 템플릿으로 신규 항목 추가
-
-Ip: ""
-Id: ""
-Info: ["",""]
-Password: ""
-Note: ""
-
-
-
-
-
-
-
-
-
-추가 후: TreeView/그리드 즉시 갱신(무겁게 전체 JSON 재파싱 X, 현재 트리만 재구성)
-
-
-
-
-
-1) 폼에 Add 버튼 추가 (생성자 부분)
-
-
-buttonLoad/buttonSave처럼 상단에 버튼 하나 더 추가하세요.
-
-
+// Add 버튼
 private readonly Button buttonAdd;
 
-public JsonEditorForm()
-{
-    // ... 기존 코드 ...
+// 현재 선택된 배열(추가 대상)
+private JArray? selectedArrayForAdd;
 
-    buttonAdd = new Button { Text = "Add Item", Dock = DockStyle.Top, Enabled = false };
-    buttonAdd.Click += ButtonAdd_Click;
-
-    rightPanel.Controls.Add(dataGridView);
-    rightPanel.Controls.Add(buttonAdd);   // <= Save/Load 위에 넣고 싶으면 순서 조정
-    rightPanel.Controls.Add(buttonSave);
-    rightPanel.Controls.Add(buttonLoad);
-
-    // ... 기존 코드 ...
-}
-
-
-
-
-2) “어떤 배열에서 Add 허용/템플릿 선택” 규칙 정의
-
-
-가장 가볍고 확실한 방법은 JToken.Path 기반으로 규칙을 두는 겁니다.
-
-(예: devices, servers, accounts 같은 배열 경로를 지정)
-
+// 어떤 템플릿으로 추가할지
+private AddTemplateType selectedAddTemplate = AddTemplateType.None;
 
 private enum AddTemplateType
 {
     None,
-    DefaultKeyValue,
-    IpIdInfoPasswordNote
+    DefaultKeyValue,          // Key/Value 형태
+    IpIdInfoPasswordNote      // Ip/Id/Info/Password/Note + Info:[...]
 }
 
-// 여기에 “특정 배열 경로”를 등록
-// 예: root.devices, config.accounts 등 실제 JSON 경로로 맞춰서 넣으면 됨
-private static readonly HashSet<string> ArraysUsingIpTemplate = new(StringComparer.OrdinalIgnoreCase)
+// "특정 배열" 목록: 여기에 Path만 넣으면 됨
+// 예: devices 배열이면 "devices"
+private static readonly HashSet<string> ArraysUsingIpTemplate =
+    new(StringComparer.OrdinalIgnoreCase)
 {
-    "devices",            // 예시: root에 devices:[]
-    "accounts",           // 예시
-    "network.items",      // 예시: network:{ items:[] }
+    "devices"
 };
 
 
 
-중요: JArray의 Path는 devices / network.items 같은 형태로 나옵니다.
 
-(루트가 배열이면 Path가 빈 문자열일 수도 있음)
-
+2) 생성자에서 Add 버튼 UI 추가
 
 
-3) TreeView 선택 시 Add 버튼 활성화/비활성화
+buttonLoad/buttonSave 만들던 곳에 아래 추가:
 
 
-TreeView_AfterSelect 맨 마지막에 아래 로직을 추가하세요.
+buttonAdd = new Button
+{
+    Text = "Add Item",
+    Dock = DockStyle.Top,
+    Enabled = false
+};
+buttonAdd.Click += ButtonAdd_Click;
+
+// rightPanel.Controls.Add 순서에 추가
+rightPanel.Controls.Add(dataGridView);
+rightPanel.Controls.Add(buttonAdd);
+rightPanel.Controls.Add(buttonSave);
+rightPanel.Controls.Add(buttonLoad);
 
 
-private JArray? selectedArrayForAdd;
-private AddTemplateType selectedAddTemplate = AddTemplateType.None;
+
+
+3) TreeView 선택 시 Add 버튼 활성화 로직
+
+
+TreeView_AfterSelect 끝부분에 호출만 추가:
+
 
 private void TreeView_AfterSelect(object? sender, TreeViewEventArgs e)
 {
-    // ... 기존 그리드 표시 로직 ...
+    // ... 기존: token을 그리드로 보여주는 코드 ...
 
-    // Add 버튼 상태 갱신
     UpdateAddButtonState(e.Node);
 }
+
+
+
+그리고 아래 함수 추가:
+
 
 private void UpdateAddButtonState(TreeNode? node)
 {
@@ -130,48 +94,49 @@ private void UpdateAddButtonState(TreeNode? node)
     selectedAddTemplate = AddTemplateType.None;
     buttonAdd.Enabled = false;
 
-    if (node?.Tag is not JToken token) return;
+    if (node?.Tag is not JToken token)
+        return;
 
-    // 배열 노드일 때만 Add 고려
-    if (token is JArray arr)
-    {
-        // 어떤 템플릿을 쓸지 결정
-        var tpl = ResolveAddTemplate(arr);
-        if (tpl != AddTemplateType.None)
-        {
-            selectedArrayForAdd = arr;
-            selectedAddTemplate = tpl;
-            buttonAdd.Enabled = true;
-        }
-    }
+    if (token is not JArray arr)
+        return;
+
+    // 어떤 템플릿을 적용할지 결정
+    var tpl = ResolveAddTemplate(arr);
+    if (tpl == AddTemplateType.None)
+        return;
+
+    selectedArrayForAdd = arr;
+    selectedAddTemplate = tpl;
+    buttonAdd.Enabled = true;
 }
 
 private AddTemplateType ResolveAddTemplate(JArray arr)
 {
-    // 1) 경로로 매칭
+    // JArray.Path 예: "devices" / "devices[0].info"
     var path = arr.Path ?? string.Empty;
 
-    // 루트가 배열이면 path가 ""일 수 있으니, 그 경우는 기본 템플릿만 허용하는 식으로 처리 가능
+    // 루트 배열이면 Path가 ""일 수 있음
     if (string.IsNullOrWhiteSpace(path))
         return AddTemplateType.DefaultKeyValue;
 
-    // 2) 특정 배열은 Ip 템플릿
+    // 특정 배열이면 Ip 템플릿
     if (ArraysUsingIpTemplate.Contains(path))
         return AddTemplateType.IpIdInfoPasswordNote;
 
-    // 3) 그 외 배열은 기본 Key:Value 템플릿 허용(원하면 제한 가능)
+    // 그 외 배열은 기본 Key/Value 템플릿 허용(원하면 None으로 막을 수 있음)
     return AddTemplateType.DefaultKeyValue;
 }
 
 
 
 
-4) Add 버튼 클릭 시 새 항목 추가
+4) Add 버튼 클릭 시 실제 배열에 항목 추가
 
 
 private void ButtonAdd_Click(object? sender, EventArgs e)
 {
-    if (selectedArrayForAdd == null) return;
+    if (selectedArrayForAdd == null)
+        return;
 
     JObject newItem = selectedAddTemplate switch
     {
@@ -182,14 +147,13 @@ private void ButtonAdd_Click(object? sender, EventArgs e)
 
     selectedArrayForAdd.Add(newItem);
 
-    // UI 즉시 반영 (가볍게 트리 재구성 후 동일 배열 노드 재선택)
+    // 트리/그리드 갱신(가볍게)
+    // 이미 있는 함수가 있다면 그걸 쓰면 됨:
     RebuildTreeAndReselect(selectedArrayForAdd);
 }
 
 private JObject CreateDefaultKeyValueTemplate()
 {
-    // “키:값만 추가” -> 최소 템플릿
-    // 키 이름은 임시로 넣고 사용자가 수정하게 함
     return new JObject
     {
         ["Key"] = "",
@@ -212,28 +176,43 @@ private JObject CreateIpIdInfoPasswordNoteTemplate()
 
 
 
-5) (선택) Add 후 그리드에 새 행이 보이게 하기
-
-
-현재 구현이 “배열 선택 시 객체 배열을 테이블로 표시”라면, RebuildTreeAndReselect(selectedArrayForAdd) 후 그리드가 자동으로 다시 바인딩되면서 새 행이 보입니다.
-
-
-만약 “배열 내부의 [0] 같은 객체를 클릭해야만 그리드가 보이는 방식”이라면, Add 후에 [마지막 인덱스] 노드를 자동 선택하는 로직을 추가하면 됩니다.
-
-
-
-정리
+5) “devices.info 로 넣으면 되냐”에 대한 결론 적용
 
 
 
 
-가볍게 가려면: “배열 Path 매칭 → Add 버튼 활성화 → 템플릿 JObject 생성 → arr.Add() → 트리만 재구성”이 제일 단순하고 빠릅니다.
+devices 배열에 템플릿 적용하려면 ArraysUsingIpTemplate에 "devices" 넣으면 됩니다.
 
 
-JValue.Parent null 같은 문제도 피하려면, 편집 대상은 되도록 JObject[prop]=... 방식으로만 업데이트하는 구조가 안정적입니다.
+devices[0].info 같은 내부 배열에 템플릿을 적용하려면 "devices[0].info"는 인덱스가 바뀌므로 보통 EndsWith(".info") 같은 규칙을 추가합니다.
 
 
 
 
-원하면 다음 정보를 안 묻고도 적용 가능하게, 위 ArraysUsingIpTemplate에 들어갈 실제 배열 경로를 예시 JSON 기준으로 제가 추정해서 여러 후보로 넣어 드릴 수도 있습니다.
+원하면 아래처럼 확장:
+
+
+if (path.EndsWith(".info", StringComparison.OrdinalIgnoreCase))
+    return AddTemplateType.DefaultKeyValue; // 또는 info 전용 템플릿
+
+
+
+
+최소 수정으로 끝내는 방법
+
+
+당장 목적이 “devices 배열만 Ip/Id/Info/Password/Note로 추가”라면
+
+
+
+
+ArraysUsingIpTemplate에 "devices"만 넣고
+
+
+위 코드 그대로 붙여넣으면 됩니다.
+
+
+
+
+추가로 “어떤 배열은 Key/Value조차 추가 못하게” 하려면 ResolveAddTemplate에서 DefaultKeyValue 대신 None을 반환하도록 제한하면 됩니다.
 
