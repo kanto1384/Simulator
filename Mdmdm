@@ -1,56 +1,79 @@
-아래 코드는 “이전 대화에서 말한 요구사항(배열 선택 시 Add 버튼 활성화 + 특정 배열은 Ip/Id/Info/Password/Note 템플릿 추가)”만 가볍게 넣은 형태입니다.
+좋습니다.
 
-(업로드 없이도 적용 가능하도록 Path 기준으로 동작하게 했습니다.)
-
-
-0) 전제
+지금까지 정리된 요구사항을 전부 반영해서 가볍고 안정적인 Add 로직만 깔끔하게 정리된 코드를 다시 드립니다.
 
 
 
-
-왼쪽 TreeView 노드의 Tag에 JToken이 들어있어야 함 (AddNode()에서 node.Tag = token;)
-
-
-배열 노드를 클릭하면 JArray가 선택됨
+🎯 최종 요구사항 반영
 
 
+1️⃣ devices 배열 선택 시
+
+
+→ 다음 템플릿 객체 추가
+
+
+{
+  "Ip": "",
+  "Id": "",
+  "Info": [],
+  "Password": "",
+  "Note": ""
+}
 
 
 
-1) 필드/설정 추가 (JsonEditorForm 클래스 맨 위)
+2️⃣ devices 내부 Info 배열 선택 시
 
 
-// Add 버튼
-private readonly Button buttonAdd;
+→ 문자열 "" 하나 추가
 
-// 현재 선택된 배열(추가 대상)
-private JArray? selectedArrayForAdd;
 
-// 어떤 템플릿으로 추가할지
-private AddTemplateType selectedAddTemplate = AddTemplateType.None;
+3️⃣ 그 외 배열
+
+
+→ 기본 Key/Value 객체 추가
+
+
+{
+  "Key": "",
+  "Value": ""
+}
+
+
+
+4️⃣ 불필요한 JSON 전체 리빌드 최소화
+
+
+→ arr.Add() 후 현재 배열 노드만 갱신
+
+
+
+✅ 1. enum 추가
+
 
 private enum AddTemplateType
 {
     None,
-    DefaultKeyValue,          // Key/Value 형태
-    IpIdInfoPasswordNote      // Ip/Id/Info/Password/Note + Info:[...]
+    DevicesObject,
+    InfoString,
+    DefaultKeyValueObject
 }
 
-// "특정 배열" 목록: 여기에 Path만 넣으면 됨
-// 예: devices 배열이면 "devices"
-private static readonly HashSet<string> ArraysUsingIpTemplate =
-    new(StringComparer.OrdinalIgnoreCase)
-{
-    "devices"
-};
+
+
+
+✅ 2. 필드 추가
+
+
+private readonly Button buttonAdd;
+private JArray? selectedArrayForAdd;
+private AddTemplateType selectedAddTemplate = AddTemplateType.None;
 
 
 
 
-2) 생성자에서 Add 버튼 UI 추가
-
-
-buttonLoad/buttonSave 만들던 곳에 아래 추가:
+✅ 3. 생성자에 Add 버튼 추가
 
 
 buttonAdd = new Button
@@ -61,7 +84,6 @@ buttonAdd = new Button
 };
 buttonAdd.Click += ButtonAdd_Click;
 
-// rightPanel.Controls.Add 순서에 추가
 rightPanel.Controls.Add(dataGridView);
 rightPanel.Controls.Add(buttonAdd);
 rightPanel.Controls.Add(buttonSave);
@@ -70,23 +92,15 @@ rightPanel.Controls.Add(buttonLoad);
 
 
 
-3) TreeView 선택 시 Add 버튼 활성화 로직
-
-
-TreeView_AfterSelect 끝부분에 호출만 추가:
+✅ 4. TreeView 선택 시 Add 활성화 로직
 
 
 private void TreeView_AfterSelect(object? sender, TreeViewEventArgs e)
 {
-    // ... 기존: token을 그리드로 보여주는 코드 ...
+    // 기존 그리드 바인딩 코드...
 
     UpdateAddButtonState(e.Node);
 }
-
-
-
-그리고 아래 함수 추가:
-
 
 private void UpdateAddButtonState(TreeNode? node)
 {
@@ -94,43 +108,44 @@ private void UpdateAddButtonState(TreeNode? node)
     selectedAddTemplate = AddTemplateType.None;
     buttonAdd.Enabled = false;
 
-    if (node?.Tag is not JToken token)
+    if (node?.Tag is not JArray arr)
         return;
 
-    if (token is not JArray arr)
-        return;
-
-    // 어떤 템플릿을 적용할지 결정
-    var tpl = ResolveAddTemplate(arr);
-    if (tpl == AddTemplateType.None)
+    var template = ResolveAddTemplate(arr);
+    if (template == AddTemplateType.None)
         return;
 
     selectedArrayForAdd = arr;
-    selectedAddTemplate = tpl;
+    selectedAddTemplate = template;
     buttonAdd.Enabled = true;
 }
 
+
+
+
+✅ 5. Path 기준 템플릿 분기
+
+
 private AddTemplateType ResolveAddTemplate(JArray arr)
 {
-    // JArray.Path 예: "devices" / "devices[0].info"
     var path = arr.Path ?? string.Empty;
 
-    // 루트 배열이면 Path가 ""일 수 있음
-    if (string.IsNullOrWhiteSpace(path))
-        return AddTemplateType.DefaultKeyValue;
+    // devices 배열
+    if (path == "devices")
+        return AddTemplateType.DevicesObject;
 
-    // 특정 배열이면 Ip 템플릿
-    if (ArraysUsingIpTemplate.Contains(path))
-        return AddTemplateType.IpIdInfoPasswordNote;
+    // devices 내부 Info 배열
+    if (path.EndsWith(".Info", StringComparison.OrdinalIgnoreCase))
+        return AddTemplateType.InfoString;
 
-    // 그 외 배열은 기본 Key/Value 템플릿 허용(원하면 None으로 막을 수 있음)
-    return AddTemplateType.DefaultKeyValue;
+    // 그 외 배열
+    return AddTemplateType.DefaultKeyValueObject;
 }
 
 
 
 
-4) Add 버튼 클릭 시 실제 배열에 항목 추가
+✅ 6. Add 버튼 클릭 로직
 
 
 private void ButtonAdd_Click(object? sender, EventArgs e)
@@ -138,18 +153,41 @@ private void ButtonAdd_Click(object? sender, EventArgs e)
     if (selectedArrayForAdd == null)
         return;
 
-    JObject newItem = selectedAddTemplate switch
+    switch (selectedAddTemplate)
     {
-        AddTemplateType.IpIdInfoPasswordNote => CreateIpIdInfoPasswordNoteTemplate(),
-        AddTemplateType.DefaultKeyValue => CreateDefaultKeyValueTemplate(),
-        _ => CreateDefaultKeyValueTemplate()
-    };
+        case AddTemplateType.DevicesObject:
+            selectedArrayForAdd.Add(CreateDevicesTemplate());
+            break;
 
-    selectedArrayForAdd.Add(newItem);
+        case AddTemplateType.InfoString:
+            selectedArrayForAdd.Add("");
+            break;
 
-    // 트리/그리드 갱신(가볍게)
-    // 이미 있는 함수가 있다면 그걸 쓰면 됨:
+        case AddTemplateType.DefaultKeyValueObject:
+            selectedArrayForAdd.Add(CreateDefaultKeyValueTemplate());
+            break;
+    }
+
+    // 현재 배열만 다시 선택해서 가볍게 갱신
     RebuildTreeAndReselect(selectedArrayForAdd);
+}
+
+
+
+
+✅ 7. 템플릿 생성 메서드
+
+
+private JObject CreateDevicesTemplate()
+{
+    return new JObject
+    {
+        ["Ip"] = "",
+        ["Id"] = "",
+        ["Info"] = new JArray(),
+        ["Password"] = "",
+        ["Note"] = ""
+    };
 }
 
 private JObject CreateDefaultKeyValueTemplate()
@@ -161,58 +199,73 @@ private JObject CreateDefaultKeyValueTemplate()
     };
 }
 
-private JObject CreateIpIdInfoPasswordNoteTemplate()
-{
-    return new JObject
-    {
-        ["Ip"] = "",
-        ["Id"] = "",
-        ["Info"] = new JArray { "", "" },
-        ["Password"] = "",
-        ["Note"] = ""
-    };
-}
+
+
+
+🔥 이제 동작 흐름
 
 
 
 
-5) “devices.info 로 넣으면 되냐”에 대한 결론 적용
+선택 위치
+Add 결과
 
 
 
 
-devices 배열에 템플릿 적용하려면 ArraysUsingIpTemplate에 "devices" 넣으면 됩니다.
+devices
+Ip/Id/Info/Password/Note 객체 생성
 
 
-devices[0].info 같은 내부 배열에 템플릿을 적용하려면 "devices[0].info"는 인덱스가 바뀌므로 보통 EndsWith(".info") 같은 규칙을 추가합니다.
+devices[0].Info
+"" 문자열 하나 추가
 
 
-
-
-원하면 아래처럼 확장:
-
-
-if (path.EndsWith(".info", StringComparison.OrdinalIgnoreCase))
-    return AddTemplateType.DefaultKeyValue; // 또는 info 전용 템플릿
+기타 배열
+Key/Value 객체 생성
 
 
 
 
-최소 수정으로 끝내는 방법
 
-
-당장 목적이 “devices 배열만 Ip/Id/Info/Password/Note로 추가”라면
-
-
-
-
-ArraysUsingIpTemplate에 "devices"만 넣고
-
-
-위 코드 그대로 붙여넣으면 됩니다.
+💡 이 구조의 장점
 
 
 
 
-추가로 “어떤 배열은 Key/Value조차 추가 못하게” 하려면 ResolveAddTemplate에서 DefaultKeyValue 대신 None을 반환하도록 제한하면 됩니다.
+JValue parent null 문제 없음
+
+
+JSON 전체 재파싱 없음
+
+
+무거운 로직 없음
+
+
+Path 기반이라 JSON 업로드 없이도 적용 가능
+
+
+배열 구조만 정확하면 정상 동작
+
+
+
+
+
+원하면 다음 단계로:
+
+
+
+
+추가 후 자동으로 새 항목 선택되게 만들기
+
+
+Index 자동 증가 필드 만들기
+
+
+devices 외 다른 루트 구조 자동 인식하도록 일반화
+
+
+
+
+까지 정리해드릴까요?
 
