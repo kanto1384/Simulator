@@ -1,8 +1,182 @@
-private void RefreshGridForSelectedArray()
-{
-    if (selectedArrayForAdd == null) return;
+가능합니다. 방향도 맞습니다. “BuildPopupMapJson가 JSON 파일을 읽는 대신, 그리드뷰에서 편집된 값을 소스로 삼아서 접속/맵 생성” 구조가 더 자연스럽습니다.
 
-    var table = CreateDataTableForToken(selectedArrayForAdd);
-    dataGridView.DataSource = table;
-    dataGridView.Tag = selectedArrayForAdd;
+
+아래는 가볍고 안정적인 구현 방식입니다.
+
+
+
+목표 구조
+
+
+
+
+그리드뷰는 서버 목록(예: devices[]) 을 보여주고 편집 가능
+
+
+“접속” 버튼을 누르면:
+
+
+
+그리드뷰에서 현재 행/선택 행의 값을 읽어서
+
+
+{ Ip, Id, Password, Note, Info } 같은 객체를 만들고
+
+
+기존 BuildPopupMapJson(...) 로직에 JObject 또는 JSON string 으로 넘김
+
+
+
+
+
+
+
+
+핵심은 그리드에서 → 모델 객체(또는 JObject)로 변환하는 함수 하나만 만들면 됩니다.
+
+
+
+1) 그리드에서 “현재 선택된 서버” 꺼내기
+
+
+DataGridView가 DataTable 바인딩이라면 이렇게 가져오는 게 제일 간단합니다.
+
+
+private JObject? GetSelectedServerFromGrid()
+{
+    if (dataGridView.CurrentRow == null) return null;
+    if (dataGridView.CurrentRow.DataBoundItem is not DataRowView drv) return null;
+
+    string ip = (drv.Row.Table.Columns.Contains("Ip") ? drv["Ip"]?.ToString() : "") ?? "";
+    string id = (drv.Row.Table.Columns.Contains("Id") ? drv["Id"]?.ToString() : "") ?? "";
+    string pw = (drv.Row.Table.Columns.Contains("Password") ? drv["Password"]?.ToString() : "") ?? "";
+    string note = (drv.Row.Table.Columns.Contains("Note") ? drv["Note"]?.ToString() : "") ?? "";
+
+    // Info는 그리드에 안 보여줄 수도 있으니 기본값 처리
+    // (그리드에 "Info" 열이 있다면 string JSON으로 들어올 수 있음)
+    JArray infoArr = new JArray();
+    if (drv.Row.Table.Columns.Contains("Info"))
+    {
+        var infoStr = drv["Info"]?.ToString();
+        // "a,b" 같은 포맷이면 split 처리(원하면)
+        if (!string.IsNullOrWhiteSpace(infoStr))
+        {
+            foreach (var s in infoStr.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                infoArr.Add(s.Trim());
+        }
+    }
+
+    return new JObject
+    {
+        ["Ip"] = ip,
+        ["Id"] = id,
+        ["Password"] = pw,
+        ["Note"] = note,
+        ["Info"] = infoArr
+    };
 }
+
+
+
+
+2) BuildPopupMapJson를 “JObject 입력” 버전으로 하나 더 만들기(추천)
+
+
+기존이 파일 경로/JSON string 기반이면 오버로드 하나 추가하세요.
+
+
+private void BuildPopupMapJson(JObject server)
+{
+    // 여기서 server["Ip"], server["Password"] 등 사용
+    string ip = server["Ip"]?.ToString() ?? "";
+    string pw = server["Password"]?.ToString() ?? "";
+
+    // 기존 접속/맵 빌드 로직에 그대로 연결
+}
+
+
+
+그리고 “접속” 버튼에서:
+
+
+private void buttonConnect_Click(object sender, EventArgs e)
+{
+    var server = GetSelectedServerFromGrid();
+    if (server == null)
+    {
+        MessageBox.Show("그리드에서 서버 행을 선택하세요.");
+        return;
+    }
+
+    BuildPopupMapJson(server);
+}
+
+
+
+
+3) “그리드뷰에 ip/ps를 넣으면 좋겠다” 반영 포인트
+
+
+지금 그리드가 devices[]를 보여주는 상태라면:
+
+
+
+
+devices 템플릿에 이미 Ip, Password가 있으니 컬럼으로 표시 가능
+
+
+단, CreateDataTableForToken(JArray arr) 쪽에서 “원시 필드만 컬럼으로 만든다” 로직에
+
+Ip/Password/Id/Note를 포함시키면 바로 그리드에 뜹니다.
+
+
+
+
+(이미 “primitive property만 컬럼” 구조면 자동으로 뜹니다)
+
+
+
+4) 주의점 (무겁지 않게)
+
+
+
+
+접속 버튼 누를 때만 그리드에서 값을 읽어오면 됨
+
+
+매 셀 편집마다 JSON 전체 재구성/파싱 X
+
+
+DataRowView에서 문자열만 뽑아 JObject로 묶어서 넘기면 비용 거의 없음
+
+
+
+
+
+다음 단계(딱 1개만 확인하면 정확히 맞춰줌)
+
+
+지금 메인 폼의 BuildPopupMapJson 시그니처가 어떻게 되어있나요?
+
+
+예)
+
+
+
+
+BuildPopupMapJson(string jsonPath)
+
+
+BuildPopupMapJson(string jsonText)
+
+
+BuildPopupMapJson(JObject map)
+
+
+BuildPopupMapJson(Dictionary<string,string> data)
+
+
+
+
+시그니처 한 줄만 알려주면, 거기에 맞춰서 “그리드 → 그 함수로 바로 연결되는” 최소 변경 코드로 정확히 맞춰드릴 수 있습니다.
+
