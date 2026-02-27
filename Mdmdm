@@ -1,193 +1,176 @@
-가능합니다. 지금 캡처에 나온 흐름은:
+가능합니다. 지금 캡처 흐름을 보면 팝업이 열릴 때 여기서 주입하죠:
+
+
+_popupMapJson = BuildPopupMapJson(_index);
+
+await popup.WebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
+    BuildPopupAutoFillScript(_popupMapJson)
+);
+
+
+
+당신 아이디어대로 하면 구조가 제일 깔끔합니다.
 
 
 
 
-DeviceIndex.Load(path)가 JSON 파일을 읽어서 ByIp / ByHost 딕셔너리를 만들고
+_index / JSON 파일은 초기 캐시(기본값) 용으로만 유지
 
 
-BuildPopupMapJson(DeviceIndex index)가 index.ByIp를 순회해서
-
-{ "ip": { "id": "...", "pw": "..." } }
+팝업이 열릴 때마다 그리드뷰에서 최신 id/password를 읽어서 _popupMapJson을 만들고
 
 
-형태의 JSON 문자열을 만들어 리턴
+그걸 그대로 BuildPopupAutoFillScript()에 넣어서 주입
 
 
 
 
-이걸 “파일” 대신 “그리드뷰”에서 바로 만들도록 바꾸면 됩니다.
-
-
-아래는 그리드(DataGridView) → DeviceIndex(ByIp) → BuildPopupMapJson 재사용을 하는 최소 변경 코드입니다.
+즉, BuildPopupMapJson()이 파일이 아니라 “현재 그리드값”을 소스로 JSON을 만들어주면 끝입니다.
 
 
 
-1) DeviceIndex에 “그리드에서 로드” 함수 추가
+1) 팝업 열릴 때 그리드 기반 JSON 만들기 (최소 변경)
 
 
-DeviceIndex 클래스에 아래 메서드를 추가하세요.
+(A) 그리드에서 직접 JSON 만드는 함수 추가 (MainForm에)
 
 
-public static DeviceIndex FromGrid(DataGridView grid)
+컬럼명은 당신 기준: Ip, id, password
+
+
+private static string BuildPopupMapJsonFromGrid(DataGridView grid)
 {
-    var idx = new DeviceIndex();
+    // 결과: { "ip": { "id": "...", "pw": "..." }, ... }
+    var dict = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
-    if (grid.DataSource is not DataTable dt)
-        return idx;
+    if (grid.DataSource is not DataTable dt) 
+        return JsonSerializer.Serialize(dict);
 
-    bool hasIp = dt.Columns.Contains("Ip");
-    bool hasId = dt.Columns.Contains("Id");
-    bool hasPw = dt.Columns.Contains("Password");
+    if (!dt.Columns.Contains("Ip")) 
+        return JsonSerializer.Serialize(dict);
 
     foreach (DataRow row in dt.Rows)
     {
-        var ip = hasIp ? (row["Ip"]?.ToString() ?? "").Trim() : "";
+        var ip = (row["Ip"]?.ToString() ?? "").Trim();
         if (string.IsNullOrWhiteSpace(ip)) continue;
 
-        var item = new DeviceItem
-        {
-            ip = ip,
-            id = hasId ? (row["Id"]?.ToString() ?? "").Trim() : "",
-            password = hasPw ? (row["Password"]?.ToString() ?? "").Trim() : "",
-        };
+        var id = dt.Columns.Contains("id") ? (row["id"]?.ToString() ?? "").Trim() : "";
+        var pw = dt.Columns.Contains("password") ? (row["password"]?.ToString() ?? "").Trim() : "";
 
-        // ByIp 채움
-        idx.ByIp[ip] = item;
-
-        // host 컬럼이 있으면 ByHost도 채움(선택)
-        if (dt.Columns.Contains("host"))
-        {
-            var host = (row["host"]?.ToString() ?? "").Trim();
-            if (!string.IsNullOrWhiteSpace(host))
-                idx.ByHost[host] = item;
-        }
+        dict[ip] = new { id = id, pw = pw };
     }
 
-    return idx;
+    return JsonSerializer.Serialize(dict);
 }
 
 
 
 
-
-주의: DeviceItem 필드명이 캡처처럼 id, password, ip 소문자일 수도 있고,
-실제 클래스 정의에 따라 Id, Password일 수도 있습니다.
-
-당신 코드의 DeviceItem 멤버명에 맞춰 위 3줄만 맞추면 됩니다.
+2) NewWindowRequested에서 기존 1줄만 교체
 
 
+기존:
 
 
-
-2) MainForm에서 “파일 로드 대신 그리드 기반으로 JSON 생성”
-
-
-기존에 아마 이런 흐름이 있을 겁니다:
-
-
-var index = DeviceIndex.Load(path);
-var json = BuildPopupMapJson(index);
+_popupMapJson = BuildPopupMapJson(_index);
 
 
 
-이걸 아래로 교체:
+교체:
 
 
-var index = DeviceIndex.FromGrid(jsonEditorForm.dataGridView); // 그리드 참조
-var json = BuildPopupMapJson(index);
-
-
-
-만약 jsonEditorForm 안에 그리드가 private이면, DataTable만 꺼내서 전달하는 방식이 더 깔끔합니다.
+_popupMapJson = BuildPopupMapJsonFromGrid(_jsonEditorForm.DataGridView);
 
 
 
-3) 더 깔끔한 방식(추천): DataTable만 넘기기
 
 
-JsonEditorForm에서 DataTable 꺼내는 프로퍼티 추가
+_jsonEditorForm.DataGridView 접근이 안 되면, JsonEditorForm에 public DataGridView Grid => dataGridView; 같은 프로퍼티만 열어주면 됩니다.
+
+또는 public DataTable? CurrentTable => dataGridView.DataSource as DataTable; 방식이 더 깔끔합니다.
 
 
-public DataTable? CurrentTable => dataGridView.DataSource as DataTable;
+
+
+DataTable 방식이면:
+
+
+_popupMapJson = BuildPopupMapJsonFromTable(_jsonEditorForm.CurrentTable);
 
 
 
-DeviceIndex에 FromTable 추가
+
+3) “캐시 JSON(index)”는 어떻게 쓰냐?
 
 
-public static DeviceIndex FromTable(DataTable? dt)
+그리드가 비어있거나 아직 준비 안 된 경우 대비해서 폴백만 두면 됩니다.
+
+
+_popupMapJson = TryBuildPopupMapJsonFromGrid(_jsonEditorForm, out var json)
+    ? json
+    : BuildPopupMapJson(_index); // 캐시 기반
+
+
+
+구현:
+
+
+private static bool TryBuildPopupMapJsonFromGrid(JsonEditorForm? editor, out string json)
 {
-    var idx = new DeviceIndex();
-    if (dt == null) return idx;
+    json = "";
+    var grid = editor?.DataGridView;
+    if (grid?.DataSource is not DataTable dt || dt.Rows.Count == 0) return false;
 
-    bool hasIp = dt.Columns.Contains("Ip");
-    bool hasId = dt.Columns.Contains("Id");
-    bool hasPw = dt.Columns.Contains("Password");
-
-    foreach (DataRow row in dt.Rows)
-    {
-        var ip = hasIp ? (row["Ip"]?.ToString() ?? "").Trim() : "";
-        if (string.IsNullOrWhiteSpace(ip)) continue;
-
-        var item = new DeviceItem
-        {
-            ip = ip,
-            id = hasId ? (row["Id"]?.ToString() ?? "").Trim() : "",
-            password = hasPw ? (row["Password"]?.ToString() ?? "").Trim() : "",
-        };
-
-        idx.ByIp[ip] = item;
-    }
-    return idx;
+    json = BuildPopupMapJsonFromGrid(grid);
+    return !string.IsNullOrWhiteSpace(json);
 }
 
 
 
-MainForm에서 호출
 
-
-var idx = DeviceIndex.FromTable(jsonEditorForm.CurrentTable);
-var json = BuildPopupMapJson(idx);
+4) 이 방식의 장점
 
 
 
 
-4) 요구한 “그리드에 ip/ps를 넣으면 좋겠다”에 대한 핵심
+그리드가 “가변 데이터(사용자 편집)”니까 팝업 시점에 최신값 반영됨
 
 
-그리드 컬럼명이 Ip, Id, Password로만 맞으면 위 로직이 그대로 먹습니다.
+_index는 최초 로드 캐시로만 유지 → 초기 부팅/기본값에 유리
 
 
+버전/merge/중복 처리 필요 없음 (팝업 열 때만 한번 읽으면 됨)
 
 
-그리드에서 IP/Password를 수정하면
-
-
-DeviceIndex.FromTable()가 그 값을 읽어서
-
-
-BuildPopupMapJson()가 그대로 { ip: { id, pw } } JSON을 생성합니다.
+팝업 열리는 이벤트 자체가 빈도가 낮아서 성능 부담 거의 없음
 
 
 
 
 
-5) 가장 중요한 체크 2개
+적용 포인트 1개만 확인하면 완벽히 맞춰줌
+
+
+JsonEditorForm에 있는 그리드 컨트롤을 MainForm에서 어떻게 접근 가능해요?
 
 
 
 
-그리드 컬럼명이 실제로 Ip, Id, Password 인지
-
-
-DeviceItem의 멤버명이 ip/id/password인지 Ip/Id/Password인지
+jsonEditorForm.dataGridView가 private이면
 
 
 
+public DataGridView Grid => dataGridView; 한 줄 추가하거나
 
-이 두 개만 실제 코드에 맞게 맞추면 끝입니다.
+
+public DataTable? CurrentTable => dataGridView.DataSource as DataTable; 추가
 
 
-원하면 DeviceItem 클래스 캡처(또는 멤버명만 텍스트) 보내주면, 위 코드에서 정확히 어떤 이름으로 써야 하는지 딱 맞춰서 다시 정리해 드리겠습니다.
+
+
+
+
+
+
+둘 중 하나만 열어주면 MainForm에서 바로 연결됩니다.
 
