@@ -1,293 +1,189 @@
-있습니다.
-
-“편집 버튼 눌렀을 때 최초 열림이 느린 것”은 보통 폼 생성 직후에 JSON 파싱 + TreeView 전체 구성 + ExpandAll + Grid 초기 바인딩을 한 번에 다 해서 그렇습니다.
+가능합니다.
 
 
-다시 만들 필요 없이, 아래 순서로 개선하면 체감이 꽤 좋아집니다.
+1. 추가하기 누르면 맨 아래 새 셀 자동 선택
+
+
+Add 후에 마지막 행/첫 편집 컬럼으로 이동시키면 됩니다.
+
+
+ButtonAdd_Click 마지막에 이 부분 추가:
+
+
+RefreshGridForSelectedArray();
+
+if (dataGridView.Rows.Count > 0)
+{
+    int lastRow = dataGridView.Rows.Count - 1;
+
+    // 첫 번째 보이는 컬럼 찾기
+    DataGridViewColumn? firstVisibleCol = dataGridView.Columns
+        .Cast<DataGridViewColumn>()
+        .FirstOrDefault(c => c.Visible);
+
+    if (firstVisibleCol != null)
+    {
+        dataGridView.CurrentCell = dataGridView.Rows[lastRow].Cells[firstVisibleCol.Index];
+        dataGridView.ClearSelection();
+        dataGridView.Rows[lastRow].Cells[firstVisibleCol.Index].Selected = true;
+        dataGridView.FirstDisplayedScrollingRowIndex = lastRow;
+        dataGridView.BeginEdit(true);
+    }
+}
 
 
 
-1. ShowDialog() 전에 무거운 작업 하지 않기
+효과
 
 
-지금 new EditJson(MapPath) 생성자 안에서 바로 JSON 읽고 트리 만들고 있으면 느립니다.
 
 
-개선
+추가 후 맨 아래로 자동 스크롤
 
 
-생성자에서는 UI만 만들고, 실제 로드는 Shown 이벤트에서 하세요.
+새로 추가된 행의 첫 셀이 자동 선택
+
+
+바로 입력 가능
+
+
+
+
+원하면 Ip 컬럼으로 고정도 가능합니다.
+
+
+var col = dataGridView.Columns["Ip"];
+if (col != null)
+{
+    dataGridView.CurrentCell = dataGridView.Rows[lastRow].Cells[col.Index];
+    dataGridView.BeginEdit(true);
+}
+
+
+
+
+2. serverurl만 드롭다운으로 바꾸기
+
+
+이것도 가능합니다.
+
+
+핵심은 serverurl 컬럼만 DataGridViewComboBoxColumn으로 교체하면 됩니다.
 
 
 예시
 
 
-public partial class EditJson : Form
-{
-    private readonly string _mapPath;
+그리드 바인딩 후 한 번 실행:
 
-    public EditJson(string mapPath)
+
+private void ApplyServerUrlDropdown()
+{
+    if (!dataGridView.Columns.Contains("serverurl"))
+        return;
+
+    int colIndex = dataGridView.Columns["serverurl"].Index;
+    dataGridView.Columns.Remove("serverurl");
+
+    var comboCol = new DataGridViewComboBoxColumn
     {
-        InitializeComponent();
-        _mapPath = mapPath;
-        Shown += EditJson_Shown;
-    }
+        Name = "serverurl",
+        HeaderText = "serverurl",
+        DataPropertyName = "serverurl",
+        FlatStyle = FlatStyle.Flat
+    };
 
-    private void EditJson_Shown(object? sender, EventArgs e)
-    {
-        Shown -= EditJson_Shown;
-        LoadJsonFile(_mapPath);
-    }
+    comboCol.Items.AddRange(
+        "server1.example.com",
+        "server2.example.com",
+        "server3.example.com"
+    );
+
+    dataGridView.Columns.Insert(colIndex, comboCol);
 }
 
 
 
-이렇게 하면
+
+3. 드롭다운 값 목록을 고정 말고 따로 관리하고 싶으면
 
 
+예를 들어:
 
 
-폼은 먼저 떠서 사용자 체감이 좋아지고
-
-
-내용은 그 다음에 채워집니다.
-
-
-
-
-
-2. 최초 로드시 ExpandAll() 제거
-
-
-이게 큽니다.
-
-
-지금 문제
-
-
-JSON이 길수록 모든 노드를 강제로 펼치느라 느립니다.
-
-
-개선
-
-
-
-
-최초에는 루트나 1단계만 보여주고
-
-
-사용자가 직접 펼치게 하세요.
-
-
-
-
-수정
-
-
-// 제거
-treeView.ExpandAll();
-
-
-
-대신 필요하면:
-
-
-foreach (TreeNode node in treeView.Nodes)
-    node.Expand();
-
-
-
-이건 1단계만 펼쳐서 훨씬 가볍습니다.
-
-
-
-3. BeginUpdate / EndUpdate로 TreeView 묶기
-
-
-트리 만들 때 이거 안 쓰면 노드 추가할 때마다 계속 다시 그려서 느립니다.
-
-
-예시
-
-
-treeView.BeginUpdate();
-try
+private readonly string[] _serverUrlOptions =
 {
-    treeView.Nodes.Clear();
-    AddNode(rootJson, null, "root");
-}
-finally
+    "aaa.domain.com",
+    "bbb.domain.com",
+    "ccc.domain.com"
+};
+
+
+
+그리고:
+
+
+comboCol.Items.AddRange(_serverUrlOptions);
+
+
+
+
+4. 주의할 점
+
+
+serverurl이 지금 credentials 객체 쪽 단일값이면, devices 배열 그리드 안에서는 안 뜰 수 있습니다.
+
+
+즉 구조가 이런 경우:
+
+
 {
-    treeView.EndUpdate();
+  "credentials": {
+    "serverurl": "..."
+  },
+  "devices": [ ... ]
 }
 
 
 
-이건 꼭 넣는 게 좋습니다.
+serverurl은 devices 그리드 컬럼이 아니라 별도 상단 컨트롤(콤보박스)로 두는 게 더 맞습니다.
 
 
+이 경우 추천
 
-4. 최초 로드시 그리드 바인딩하지 않기
 
 
-처음 열 때 무조건 첫 배열을 찾아서 그리드까지 채우는 로직이 있으면 같이 느려집니다.
 
+폼 상단에 ComboBox 하나 추가
 
-개선
 
+credentials.serverurl만 거기서 수정
 
 
+devices 그리드는 그대로 유지
 
-처음에는 트리만 보여주고
 
 
-사용자가 노드를 클릭했을 때만 CreateDataTableForToken() 호출
 
+이 방식이 제일 자연스럽습니다.
 
 
 
-즉, 자동 선택/자동 그리드 채우기 있으면 빼세요.
+정리
 
 
-예:
 
 
-// 이런 자동선택 있으면 최초 로드 체감 느려짐
-SelectFirstArrayNode();
+추가 후 새 행 자동 선택: 바로 가능
 
 
+serverurl 드롭다운: 가능
 
-이거 제거하면 첫 진입이 빨라집니다.
 
+단, serverurl이 devices 배열 안 필드가 아니고 credentials 쪽이면 그리드보다 상단 ComboBox가 더 맞음
 
 
-5. DataGridView 자동 컬럼 계산 줄이기
 
 
-최초 로드시 컬럼 자동 크기 계산도 느릴 수 있습니다.
-
-
-개선
-
-
-dataGridView.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
-
-
-
-그리고 필요한 컬럼만 수동 width:
-
-
-dataGridView.Columns["Ip"].Width = 140;
-dataGridView.Columns["id"].Width = 120;
-dataGridView.Columns["password"].Width = 140;
-
-
-
-
-6. “편집” 버튼 클릭 직후 파일 저장/재로드 연속 실행 피하기
-
-
-메인폼에 이 코드가 있죠:
-
-
-_btnReloadMap.Click += async (_, _) => { LoadEdit(); ReloadMap(); await ExtractAndShowAsync(); };
-
-
-
-이건 편집창 닫자마자
-
-
-
-
-다시 맵 로드
-
-
-다시 추출
-
-
-다시 그리드 반영
-
-
-
-
-까지 한 번에 돌아서 느릴 수 있습니다.
-
-
-개선
-
-
-편집창 결과가 실제 저장됐을 때만 후처리하세요.
-
-
-예:
-
-
-private async void OpenEdit()
-{
-    using var edit = new EditJson(MapPath);
-    if (edit.ShowDialog() == DialogResult.OK)
-    {
-        ReloadMap();
-        await ExtractAndShowAsync();
-    }
-}
-
-
-
-버튼 연결:
-
-
-_btnReloadMap.Click += async (_, _) => await OpenEditAsync();
-
-
-
-
-가장 효과 큰 순서
-
-
-체감 개선 순서는 보통 이렇습니다.
-
-
-
-
-생성자에서 JSON 로드하지 말고 Shown에서 로드
-
-
-ExpandAll() 제거
-
-
-BeginUpdate/EndUpdate 추가
-
-
-자동 첫 배열 선택 제거
-
-
-그리드 자동 컬럼 크기 계산 최소화
-
-
-
-
-
-가장 최소 수정 버전
-
-
-정말 최소만 고치려면 이것만 해도 됩니다.
-
-
-A. EditJson 생성자에서 무거운 로드 제거
-
-
-B. Shown에서 로드
-
-
-C. ExpandAll() 삭제
-
-
-이 3개가 제일 큽니다.
-
-
-
-원하시면 다음 답변에서 EditJson 폼 쪽 기준으로
-
-“생성자 / Shown / LoadJsonFile” 구조만 복붙 가능하게 바로 정리해드리겠습니다.
+serverurl이 devices 안 컬럼인지, credentials 쪽 단일값인지 이것만 알려주면 더 정확히 맞춰드릴게요.
 
