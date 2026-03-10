@@ -1,176 +1,285 @@
-가능합니다. 지금 캡처 흐름을 보면 팝업이 열릴 때 여기서 주입하죠:
-
-
-_popupMapJson = BuildPopupMapJson(_index);
-
-await popup.WebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
-    BuildPopupAutoFillScript(_popupMapJson)
-);
+가능합니다. 다시 만들 수준은 아니고, 이벤트 3개 수정 + 삭제 버튼 1개 추가 정도면 됩니다.
 
 
 
-당신 아이디어대로 하면 구조가 제일 깔끔합니다.
+1) RowValidated 수정
 
 
+편집 후 트리 전체 새로고침을 빼세요.
 
 
-_index / JSON 파일은 초기 캐시(기본값) 용으로만 유지
+수정 전
 
 
-팝업이 열릴 때마다 그리드뷰에서 최신 id/password를 읽어서 _popupMapJson을 만들고
-
-
-그걸 그대로 BuildPopupAutoFillScript()에 넣어서 주입
-
-
-
-
-즉, BuildPopupMapJson()이 파일이 아니라 “현재 그리드값”을 소스로 JSON을 만들어주면 끝입니다.
-
-
-
-1) 팝업 열릴 때 그리드 기반 JSON 만들기 (최소 변경)
-
-
-(A) 그리드에서 직접 JSON 만드는 함수 추가 (MainForm에)
-
-
-컬럼명은 당신 기준: Ip, id, password
-
-
-private static string BuildPopupMapJsonFromGrid(DataGridView grid)
+private void DataGridView_RowValidated(object? sender, DataGridViewCellEventArgs e)
 {
-    // 결과: { "ip": { "id": "...", "pw": "..." }, ... }
-    var dict = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-
-    if (grid.DataSource is not DataTable dt) 
-        return JsonSerializer.Serialize(dict);
-
-    if (!dt.Columns.Contains("Ip")) 
-        return JsonSerializer.Serialize(dict);
-
-    foreach (DataRow row in dt.Rows)
+    if (rootJson != null && dataGridView.Tag is JToken editedToken)
     {
-        var ip = (row["Ip"]?.ToString() ?? "").Trim();
-        if (string.IsNullOrWhiteSpace(ip)) continue;
+        RebuildTreeAndReselect(editedToken);
+    }
+}
 
-        var id = dt.Columns.Contains("id") ? (row["id"]?.ToString() ?? "").Trim() : "";
-        var pw = dt.Columns.Contains("password") ? (row["password"]?.ToString() ?? "").Trim() : "";
 
-        dict[ip] = new { id = id, pw = pw };
+
+수정 후
+
+
+private void DataGridView_RowValidated(object? sender, DataGridViewCellEventArgs e)
+{
+    // 편집 완료만 처리
+    // 트리 전체 갱신 금지
+}
+
+
+
+
+2) CellEndEdit 수정
+
+
+여기도 값만 반영하고 끝내세요.
+
+
+수정 전
+
+
+private void DataGridView_CellEndEdit(object? sender, DataGridViewCellEventArgs e)
+{
+    dataGridView.CommitEdit(DataGridViewDataErrorContexts.Commit);
+    DataGridView_CellValueChanged(sender, e);
+
+    if (rootJson != null)
+    {
+        if (dataGridView.Tag is JToken editedToken)
+        {
+            RebuildTreeAndReselect(editedToken);
+        }
+    }
+}
+
+
+
+수정 후
+
+
+private void DataGridView_CellEndEdit(object? sender, DataGridViewCellEventArgs e)
+{
+    dataGridView.CommitEdit(DataGridViewDataErrorContexts.Commit);
+    DataGridView_CellValueChanged(sender, e);
+
+    // 여기서 트리 전체 새로고침 금지
+}
+
+
+
+
+3) ButtonAdd_Click 수정
+
+
+추가는 그리드만 갱신하면 충분하다고 했으니 이렇게 가면 됩니다.
+
+
+수정 후
+
+
+private void ButtonAdd_Click(object? sender, EventArgs e)
+{
+    if (selectedArrayForAdd == null)
+        return;
+
+    switch (selectedAddTemplate)
+    {
+        case AddTemplateType.DevicesObject:
+            selectedArrayForAdd.Add(CreateDevicesTemplate());
+            break;
+
+        case AddTemplateType.InfoString:
+            selectedArrayForAdd.Add("");
+            break;
+
+        case AddTemplateType.DefaultKeyValueObject:
+            selectedArrayForAdd.Add(CreateDefaultKeyValueTemplate());
+            break;
     }
 
-    return JsonSerializer.Serialize(dict);
+    RefreshGridForSelectedArray();
 }
 
 
 
 
-2) NewWindowRequested에서 기존 1줄만 교체
+4) 그리드만 갱신하는 함수
 
 
-기존:
+이건 Add/Delete 공용으로 씁니다.
 
 
-_popupMapJson = BuildPopupMapJson(_index);
-
-
-
-교체:
-
-
-_popupMapJson = BuildPopupMapJsonFromGrid(_jsonEditorForm.DataGridView);
-
-
-
-
-
-_jsonEditorForm.DataGridView 접근이 안 되면, JsonEditorForm에 public DataGridView Grid => dataGridView; 같은 프로퍼티만 열어주면 됩니다.
-
-또는 public DataTable? CurrentTable => dataGridView.DataSource as DataTable; 방식이 더 깔끔합니다.
-
-
-
-
-DataTable 방식이면:
-
-
-_popupMapJson = BuildPopupMapJsonFromTable(_jsonEditorForm.CurrentTable);
-
-
-
-
-3) “캐시 JSON(index)”는 어떻게 쓰냐?
-
-
-그리드가 비어있거나 아직 준비 안 된 경우 대비해서 폴백만 두면 됩니다.
-
-
-_popupMapJson = TryBuildPopupMapJsonFromGrid(_jsonEditorForm, out var json)
-    ? json
-    : BuildPopupMapJson(_index); // 캐시 기반
-
-
-
-구현:
-
-
-private static bool TryBuildPopupMapJsonFromGrid(JsonEditorForm? editor, out string json)
+private void RefreshGridForSelectedArray()
 {
-    json = "";
-    var grid = editor?.DataGridView;
-    if (grid?.DataSource is not DataTable dt || dt.Rows.Count == 0) return false;
+    if (selectedArrayForAdd == null)
+        return;
 
-    json = BuildPopupMapJsonFromGrid(grid);
-    return !string.IsNullOrWhiteSpace(json);
+    var table = CreateDataTableForToken(selectedArrayForAdd);
+    dataGridView.DataSource = table;
+    dataGridView.Tag = selectedArrayForAdd;
 }
 
 
 
 
-4) 이 방식의 장점
+5) 삭제 기능 추가 가능
+
+
+가능하고 어렵지 않습니다.
+
+
+필드 추가
+
+
+private readonly Button buttonDelete;
+
+
+
+생성자 또는 버튼 만드는 곳에 추가
+
+
+buttonDelete = new Button
+{
+    Text = "Delete Item",
+    Dock = DockStyle.Top,
+    Enabled = false
+};
+buttonDelete.Click += ButtonDelete_Click;
+
+rightPanel.Controls.Add(dataGridView);
+rightPanel.Controls.Add(buttonDelete);
+rightPanel.Controls.Add(buttonAdd);
+rightPanel.Controls.Add(buttonSave);
+rightPanel.Controls.Add(buttonLoad);
 
 
 
 
-그리드가 “가변 데이터(사용자 편집)”니까 팝업 시점에 최신값 반영됨
+6) 선택 상태에 따라 Delete 버튼 활성화
 
 
-_index는 최초 로드 캐시로만 유지 → 초기 부팅/기본값에 유리
+배열 선택되고, 그리드에서 행이 선택된 경우만 활성화.
 
 
-버전/merge/중복 처리 필요 없음 (팝업 열 때만 한번 읽으면 됨)
+TreeView_AfterSelect 끝에 추가:
 
 
-팝업 열리는 이벤트 자체가 빈도가 낮아서 성능 부담 거의 없음
-
-
-
-
-
-적용 포인트 1개만 확인하면 완벽히 맞춰줌
-
-
-JsonEditorForm에 있는 그리드 컨트롤을 MainForm에서 어떻게 접근 가능해요?
+UpdateDeleteButtonState();
 
 
 
-
-jsonEditorForm.dataGridView가 private이면
-
+그리고 그리드 선택 변경 시에도:
 
 
-public DataGridView Grid => dataGridView; 한 줄 추가하거나
+dataGridView.SelectionChanged += (_, _) => UpdateDeleteButtonState();
 
 
-public DataTable? CurrentTable => dataGridView.DataSource as DataTable; 추가
+
+함수:
 
 
+private void UpdateDeleteButtonState()
+{
+    buttonDelete.Enabled =
+        selectedArrayForAdd != null &&
+        dataGridView.CurrentRow != null &&
+        dataGridView.CurrentRow.Index >= 0;
+}
 
 
 
 
+7) 삭제 버튼 클릭
 
 
-둘 중 하나만 열어주면 MainForm에서 바로 연결됩니다.
+배열에서 현재 행 인덱스로 삭제하면 됩니다.
+
+
+private void ButtonDelete_Click(object? sender, EventArgs e)
+{
+    if (selectedArrayForAdd == null)
+        return;
+
+    if (dataGridView.CurrentRow == null)
+        return;
+
+    int rowIndex = dataGridView.CurrentRow.Index;
+    if (rowIndex < 0 || rowIndex >= selectedArrayForAdd.Count)
+        return;
+
+    var result = MessageBox.Show(
+        "선택한 항목을 삭제하시겠습니까?",
+        "삭제 확인",
+        MessageBoxButtons.YesNo,
+        MessageBoxIcon.Question);
+
+    if (result != DialogResult.Yes)
+        return;
+
+    selectedArrayForAdd.RemoveAt(rowIndex);
+
+    RefreshGridForSelectedArray();
+    UpdateDeleteButtonState();
+}
+
+
+
+
+8) 핵심 정리
+
+
+수정 포인트는 이것만 보면 됩니다.
+
+
+렉 원인 제거
+
+
+
+
+RebuildTreeAndReselect()를 편집 이벤트에서 제거
+
+
+ExpandAll()은 최초 로드 때만
+
+
+
+
+추가 기능
+
+
+
+
+Add: 배열에 추가 후 RefreshGridForSelectedArray()
+
+
+Delete: 배열에서 현재 행 삭제 후 RefreshGridForSelectedArray()
+
+
+
+
+
+9) 한 줄 결론
+
+
+지금 구조에서
+
+
+
+
+편집 시 트리 전체 갱신 제거
+
+
+추가/삭제는 그리드만 갱신
+
+
+
+
+이렇게 바꾸면 성능 문제는 대부분 해결됩니다.
+
+
+원하시면 다음 답변에서 UpdateAddButtonState, UpdateDeleteButtonState, ButtonAdd_Click, ButtonDelete_Click 포함해서 복붙용 한 덩어리 코드로 정리해드리겠습니다.
 
