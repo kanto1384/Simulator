@@ -1,98 +1,311 @@
-private System.Windows.Forms.Timer? _autoExtractTimer;
-private bool _autoExtractBusy;
+예외 자체를 보고 싶으면 이벤트 핸들러 후킹보다 FirstChanceException 후킹부터 해보는 게 제일 빠르다.
 
-// 마지막 테이블 상태(변화 감지용)
-private int _lastRowCount = -1;
-private string _lastFirstKey = "";
 
-private async Task<bool> JsHasLoadingOverlayAsync()
+이건 내부에서 catch 되기 전 예외도 일단 한 번 볼 수 있음.
+
+즉 네가 말한:
+
+
+
+
+내부 3번 단계에서 예외처리해서 계속 동작할 수도 있음
+
+
+
+
+이 경우도 예외 발생 자체는 감지 가능하다.
+
+
+
+1. 가장 먼저 해볼 코드
+
+
+using System;
+using System.Diagnostics;
+using System.Runtime.ExceptionServices;
+
+public static class ExceptionHook
 {
-    // ✅ Id_line / id_line 둘 다 체크
-    string js =
-        "(function(){" +
-        "  return !!(" +
-        "    document.querySelector('#id_line') || document.querySelector('#Id_line') ||" +
-        "    document.querySelector('#cont')" +
-        "  );" +
-        "})()";
-
-    var raw = await _web.CoreWebView2.ExecuteScriptAsync(js);
-    return raw.Contains("true", StringComparison.OrdinalIgnoreCase);
-}
-
-private async Task<(int rowCount, string firstKey)> JsGetTableSignatureAsync()
-{
-    // ✅ 테이블이 없으면 (0,"")
-    // ✅ 있으면 row count + 첫 행의 ip/host(네 인덱스 5,6)로 서명 생성
-    string js =
-        "(function(){" +
-        "  var rows = document.querySelectorAll('#seltable tbody tr');" +
-        "  if (!rows || rows.length === 0) return JSON.stringify({c:0,k:''});" +
-        "  var tds = rows[0].querySelectorAll('td');" +
-        "  var ip = (tds && tds.length>6) ? (tds[5].innerText||'').trim() : '';" +
-        "  var host = (tds && tds.length>6) ? (tds[6].innerText||'').trim() : '';" +
-        "  return JSON.stringify({c:rows.length,k:(ip+'|'+host)});" +
-        "})()";
-
-    var raw = await _web.CoreWebView2.ExecuteScriptAsync(js);
-
-    // WebView2 반환은 JSON string이므로 한 번 풀기
-    var jsonText = System.Text.Json.JsonSerializer.Deserialize<string>(raw) ?? "{\"c\":0,\"k\":\"\"}";
-    using var doc = System.Text.Json.JsonDocument.Parse(jsonText);
-
-    int c = 0;
-    string k = "";
-    if (doc.RootElement.TryGetProperty("c", out var pc)) c = pc.GetInt32();
-    if (doc.RootElement.TryGetProperty("k", out var pk)) k = pk.GetString() ?? "";
-
-    return (c, k);
-}
-
-private void StartAutoExtractWatcher()
-{
-    if (_autoExtractTimer != null) return;
-
-    _autoExtractTimer = new System.Windows.Forms.Timer();
-    _autoExtractTimer.Interval = 200; // ✅ 항상 200ms로 가도 부담 거의 없음(짧은 로딩 놓치지 않게)
-
-    _autoExtractTimer.Tick += async (s, e) =>
+    public static void Register()
     {
-        if (_autoExtractBusy) return;
-        if (_web.CoreWebView2 == null) return;
+        AppDomain.CurrentDomain.FirstChanceException += CurrentDomain_FirstChanceException;
+        AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+    }
 
-        _autoExtractBusy = true;
+    private static void CurrentDomain_FirstChanceException(object sender, FirstChanceExceptionEventArgs e)
+    {
         try
         {
-            // 1) 로딩 오버레이가 보이면 추출 금지(아직 갱신 중)
-            bool isLoading = await JsHasLoadingOverlayAsync();
-            if (isLoading) return;
+            // 너무 많이 찍히면 여기서 필터링
+            if (IsTargetException(e.Exception))
+            {
+                Debug.WriteLine("[FirstChanceException] " + e.Exception.GetType().FullName);
+                Debug.WriteLine("[Message] " + e.Exception.Message);
+                Debug.WriteLine("[StackTrace] " + e.Exception.StackTrace);
 
-            // 2) 로딩이 없을 때 테이블 시그니처 확인
-            var sig = await JsGetTableSignatureAsync();
-
-            // 테이블이 아직 없으면 스킵
-            if (sig.rowCount <= 0) return;
-
-            // 3) "테이블 내용이 바뀐 순간"에만 자동 추출
-            // (오버레이를 못 봐도 변화가 생기면 잡힘)
-            bool changed = (sig.rowCount != _lastRowCount) || !string.Equals(sig.firstKey, _lastFirstKey, StringComparison.Ordinal);
-
-            if (!changed) return;
-
-            _lastRowCount = sig.rowCount;
-            _lastFirstKey = sig.firstKey;
-
-            await ExtractAndShowAsync();
+                // 필요하면 별도 이벤트 호출
+                NegativeShortExceptionDetected?.Invoke(null, new NegativeShortExceptionEventArgs
+                {
+                    Exception = e.Exception,
+                    Source = e.Exception.Source,
+                    Message = e.Exception.Message,
+                    StackTrace = e.Exception.StackTrace
+                });
+            }
         }
         catch
         {
-            // 무시(일시 DOM 변경/로그인 전/전환 중)
+            // 예외 후킹 로직 때문에 다시 죽지 않게 방어
         }
-        finally
-        {
-            _autoExtractBusy = false;
-        }
-    };
+    }
 
-    _autoExtractTimer.Start();
+    private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        try
+        {
+            var ex = e.ExceptionObject as Exception;
+
+            Debug.WriteLine("[UnhandledException] " + ex?.GetType().FullName);
+            Debug.WriteLine("[Message] " + ex?.Message);
+            Debug.WriteLine("[StackTrace] " + ex?.StackTrace);
+        }
+        catch
+        {
+        }
+    }
+
+    private static bool IsTargetException(Exception ex)
+    {
+        if (ex == null)
+            return false;
+
+        // 필요에 따라 조건 추가
+        if (ex is OverflowException)
+            return true;
+
+        if (ex is InvalidCastException)
+            return true;
+
+        if (!string.IsNullOrEmpty(ex.Message) &&
+            (ex.Message.Contains("short") ||
+             ex.Message.Contains("ushort") ||
+             ex.Message.Contains("Int16") ||
+             ex.Message.Contains("UInt16") ||
+             ex.Message.Contains("overflow") ||
+             ex.Message.Contains("범위")))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    public static event EventHandler<NegativeShortExceptionEventArgs> NegativeShortExceptionDetected;
 }
+
+public class NegativeShortExceptionEventArgs : EventArgs
+{
+    public Exception Exception { get; set; }
+    public string Source { get; set; }
+    public string Message { get; set; }
+    public string StackTrace { get; set; }
+}
+
+
+
+
+2. 시작할 때 등록
+
+
+프로그램 시작 지점에서 한 번 등록:
+
+
+static void Main(string[] args)
+{
+    ExceptionHook.Register();
+
+    ExceptionHook.NegativeShortExceptionDetected += ExceptionHook_NegativeShortExceptionDetected;
+
+    // 이후 컨트롤 서버 시작 / OPC UA 연결 / DLL 로드
+}
+
+
+
+private static void ExceptionHook_NegativeShortExceptionDetected(object sender, NegativeShortExceptionEventArgs e)
+{
+    Console.WriteLine("예외 감지됨");
+    Console.WriteLine(e.Exception.GetType().FullName);
+    Console.WriteLine(e.Message);
+    Console.WriteLine(e.StackTrace);
+}
+
+
+
+
+3. 왜 이걸 먼저 해보라고 하냐
+
+
+이 방식이면 아래 둘 다 확인 가능하다.
+
+
+경우 A
+
+
+내부에서 예외가 나고 catch도 함
+
+→ FirstChanceException 에서는 보임
+
+
+경우 B
+
+
+예외가 밖으로 안 나와서 프로그램이 죽음
+
+→ UnhandledException 에서 보임
+
+
+즉 “실제로 예외가 발생하는지” 자체를 확인하기 좋음
+
+
+
+4. 주의점
+
+
+FirstChanceException은 엄청 많이 뜰 수 있음
+
+
+프레임워크 내부 예외까지 다 보일 수 있어서
+
+필터링 없이 쓰면 로그가 폭발한다.
+
+
+그래서 처음엔 최소한 이렇게라도 거르는 게 좋다.
+
+
+if (e.Exception is OverflowException || e.Exception is InvalidCastException)
+{
+    // 로그
+}
+
+
+
+또는 특정 모듈명으로 거르기:
+
+
+if (e.Exception.StackTrace != null &&
+    e.Exception.StackTrace.Contains("네솔루션DLL이름"))
+{
+    // 로그
+}
+
+
+
+
+5. 네가 원하는 “별도 이벤트 핸들러 등록” 형태로도 가능
+
+
+이렇게 이미 만들어둔 거다:
+
+
+ExceptionHook.NegativeShortExceptionDetected += ExceptionHook_NegativeShortExceptionDetected;
+
+
+
+즉 예외 후킹 자체는 전역에서 하고,
+
+실제 대응은 네가 원하는 별도 핸들러에서 받으면 된다.
+
+
+
+6. 더 직접적인 테스트용 샘플
+
+
+음수 들어올 때 일부러 unsigned 변환 예외 유도:
+
+
+using System;
+
+class Test
+{
+    static void Main()
+    {
+        ExceptionHook.Register();
+        ExceptionHook.NegativeShortExceptionDetected += OnNegativeException;
+
+        try
+        {
+            short plcValue = -1;
+
+            // checked로 강제하면 음수 -> ushort 변환 시 예외 발생
+            ushort solutionValue = checked((ushort)plcValue);
+
+            Console.WriteLine(solutionValue);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Main Catch: " + ex.Message);
+        }
+
+        Console.ReadLine();
+    }
+
+    private static void OnNegativeException(object sender, NegativeShortExceptionEventArgs e)
+    {
+        Console.WriteLine("[별도 핸들러] " + e.Exception.GetType().Name);
+        Console.WriteLine("[별도 핸들러] " + e.Message);
+    }
+}
+
+
+
+
+7. 여기서 중요한 점
+
+
+이 코드로 확인 가능한 건:
+
+
+
+
+예외가 정말 발생하는지
+
+
+내부에서 catch되는지
+
+
+별도 후킹 이벤트에서 받을 수 있는지
+
+
+
+
+즉 네가 말한 “해보고 판단”에 가장 맞는 방식이다.
+
+
+
+8. 실무 결론
+
+
+너 목적이 예외 자체 감시면 우선순위는 이렇다.
+
+
+
+
+FirstChanceException 등록
+
+
+UnhandledException 등록
+
+
+예외 타입/메시지/스택으로 필터링
+
+
+별도 커스텀 이벤트로 전달
+
+
+
+
+
+원하면 다음 답변에서
+
+네 구조에 맞게 컨트롤 서버/DLL 프로젝트 어디 파일에 넣어야 하는지까지 바로 짚어주겠다.
+
