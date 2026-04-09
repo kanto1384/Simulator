@@ -1,189 +1,371 @@
-가능합니다.
+0. 목표
 
 
-1. 추가하기 누르면 맨 아래 새 셀 자동 선택
-
-
-Add 후에 마지막 행/첫 편집 컬럼으로 이동시키면 됩니다.
-
-
-ButtonAdd_Click 마지막에 이 부분 추가:
-
-
-RefreshGridForSelectedArray();
-
-if (dataGridView.Rows.Count > 0)
-{
-    int lastRow = dataGridView.Rows.Count - 1;
-
-    // 첫 번째 보이는 컬럼 찾기
-    DataGridViewColumn? firstVisibleCol = dataGridView.Columns
-        .Cast<DataGridViewColumn>()
-        .FirstOrDefault(c => c.Visible);
-
-    if (firstVisibleCol != null)
-    {
-        dataGridView.CurrentCell = dataGridView.Rows[lastRow].Cells[firstVisibleCol.Index];
-        dataGridView.ClearSelection();
-        dataGridView.Rows[lastRow].Cells[firstVisibleCol.Index].Selected = true;
-        dataGridView.FirstDisplayedScrollingRowIndex = lastRow;
-        dataGridView.BeginEdit(true);
-    }
-}
-
-
-
-효과
+네 목적:
 
 
 
 
-추가 후 맨 아래로 자동 스크롤
+로컬 PC에 Solace 서버 설치
 
 
-새로 추가된 행의 첫 셀이 자동 선택
+Docker로 실행
 
 
-바로 입력 가능
+localhost에서 운영과 비슷한 환경 구성
 
 
-
-
-원하면 Ip 컬럼으로 고정도 가능합니다.
-
-
-var col = dataGridView.Columns["Ip"];
-if (col != null)
-{
-    dataGridView.CurrentCell = dataGridView.Rows[lastRow].Cells[col.Index];
-    dataGridView.BeginEdit(true);
-}
+이후 VPN / Queue / Replay 테스트
 
 
 
 
-2. serverurl만 드롭다운으로 바꾸기
+즉 지금은 “내 PC에 Solace Broker 하나 띄우기” 단계다.
 
 
-이것도 가능합니다.
+
+1단계: Docker Desktop 설치
 
 
-핵심은 serverurl 컬럼만 DataGridViewComboBoxColumn으로 교체하면 됩니다.
+먼저 Docker Desktop 설치:
 
 
-예시
+공식:
+https://www.docker.com/products/docker-desktop/
 
 
-그리드 바인딩 후 한 번 실행:
+설치 후 반드시 확인:
 
 
-private void ApplyServerUrlDropdown()
-{
-    if (!dataGridView.Columns.Contains("serverurl"))
-        return;
+docker --version
+docker compose version
 
-    int colIndex = dataGridView.Columns["serverurl"].Index;
-    dataGridView.Columns.Remove("serverurl");
 
-    var comboCol = new DataGridViewComboBoxColumn
-    {
-        Name = "serverurl",
-        HeaderText = "serverurl",
-        DataPropertyName = "serverurl",
-        FlatStyle = FlatStyle.Flat
-    };
 
-    comboCol.Items.AddRange(
-        "server1.example.com",
-        "server2.example.com",
-        "server3.example.com"
-    );
+CMD 열고 입력.
 
-    dataGridView.Columns.Insert(colIndex, comboCol);
-}
+
+정상 예:
+
+
+Docker version 27.x.x
+Docker Compose version v2.x.x
 
 
 
 
-3. 드롭다운 값 목록을 고정 말고 따로 관리하고 싶으면
+2단계: 폴더 만들기
 
 
-예를 들어:
+예:
 
 
-private readonly string[] _serverUrlOptions =
-{
-    "aaa.domain.com",
-    "bbb.domain.com",
-    "ccc.domain.com"
-};
+C:\SolaceDocker
+
+
+
+직접 만들어도 되고 CMD로:
+
+
+mkdir C:\SolaceDocker
+cd C:\SolaceDocker
+
+
+
+
+3단계: docker-compose.yml 만들기
+
+
+메모장 열어서 아래 내용 저장:
+
+
+파일명:
+
+
+docker-compose.yml
+
+
+
+내용:
+
+
+services:
+  solace:
+    image: solace/solace-pubsub-standard:latest
+    container_name: local-solace
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 2448
+        hard: 6592
+    ports:
+      - "8080:8080"
+      - "55555:55555"
+      - "2222:2222"
+    environment:
+      username_admin_globalaccesslevel: admin
+      username_admin_password: admin
+
+
+
+
+4단계: CMD 실행
+
+
+이제 CMD 열고:
+
+
+cd C:\SolaceDocker
+docker compose up -d
+
+
+
+여기서 무슨 일이 일어나냐:
+
+
+처음 실행 시:
+
+
+
+
+Solace 이미지 다운로드
+
+
+컨테이너 생성
+
+
+자동 실행
+
+
+
+
+처음은 1~3분 걸릴 수 있음.
+
+
+
+5단계: 정상 실행 확인
+
+
+입력:
+
+
+docker ps
+
+
+
+정상 예:
+
+
+CONTAINER ID   IMAGE
+xxxxxx         solace/solace-pubsub-standard
 
 
 
 그리고:
 
 
-comboCol.Items.AddRange(_serverUrlOptions);
+docker logs local-solace
+
+
+
+마지막에 이런 느낌 나오면 정상:
+
+
+Primary Virtual Router is Active
+System is ready
 
 
 
 
-4. 주의할 점
+6단계: 웹 관리자 접속
 
 
-serverurl이 지금 credentials 객체 쪽 단일값이면, devices 배열 그리드 안에서는 안 뜰 수 있습니다.
+브라우저 열기:
 
 
-즉 구조가 이런 경우:
-
-
-{
-  "credentials": {
-    "serverurl": "..."
-  },
-  "devices": [ ... ]
-}
+http://localhost:8080
 
 
 
-serverurl은 devices 그리드 컬럼이 아니라 별도 상단 컨트롤(콤보박스)로 두는 게 더 맞습니다.
+로그인:
 
 
-이 경우 추천
+ID: admin
+PW: admin
 
 
 
 
-폼 상단에 ComboBox 하나 추가
+7단계: 여기까지 되면 설치 완료
 
 
-credentials.serverurl만 거기서 수정
+이 상태면 이미 서버 설치 끝이다.
 
 
-devices 그리드는 그대로 유지
-
-
-
-
-이 방식이 제일 자연스럽습니다.
-
-
-
-정리
+운영 서버랑 동일하게:
 
 
 
 
-추가 후 새 행 자동 선택: 바로 가능
+SMF 포트 55555 열림
 
 
-serverurl 드롭다운: 가능
+관리 콘솔 8080 열림
 
 
-단, serverurl이 devices 배열 안 필드가 아니고 credentials 쪽이면 그리드보다 상단 ComboBox가 더 맞음
+CLI 2222 열림
 
 
 
 
-serverurl이 devices 안 컬럼인지, credentials 쪽 단일값인지 이것만 알려주면 더 정확히 맞춰드릴게요.
+즉 네 C# 코드에서도 바로 연결 가능:
+
+
+Host = "localhost:55555"
+VPN = "default"
+Username = "admin"
+Password = "admin"
+
+
+
+
+8단계: 서버 중지 / 재시작 방법
+
+
+중지:
+
+
+docker compose down
+
+
+
+재시작:
+
+
+docker compose up -d
+
+
+
+
+9단계: 자주 발생하는 오류
+
+
+
+오류1: docker compose not recognized
+
+
+→ Docker Desktop 설치 안됨
+
+
+
+오류2: port 55555 already in use
+
+
+운영 Solace나 다른 프로세스 사용 중
+
+
+해결:
+
+
+compose 파일 수정:
+
+
+- "55556:55555"
+
+
+
+그러면 접속은:
+
+
+localhost:55556
+
+
+
+
+오류3: localhost:8080 접속 안됨
+
+
+브로커 초기화 중일 수 있음
+
+1분 기다려.
+
+
+
+10단계: 다음 단계
+
+
+설치 끝나면 다음으로:
+
+
+
+
+VPN 생성
+
+
+Queue 생성
+
+
+Replay 활성화
+
+
+C# 연결 테스트
+
+
+
+
+
+핵심 답변
+
+
+네 질문:
+
+
+
+
+cmd 저거 입력하면 끝?
+
+
+
+
+답:
+
+
+맞다.
+정확히는:
+
+
+cd C:\SolaceDocker
+docker compose up -d
+
+
+
+이 명령 한 번이면 서버는 올라간다.
+
+
+
+지금 네가 해야 할 딱 첫 행동
+
+
+
+
+Docker Desktop 설치
+
+
+위 compose 파일 저장
+
+
+CMD에서 실행:
+
+
+
+
+docker compose up -d
+
+
+
+
+설치 끝나면 바로 다음 단계로
+
+“VPN 만들고 Queue 만들기” 이어서 가면 된다.
 
