@@ -1,187 +1,151 @@
-0. 목표
+이번엔 정상적으로 많이 진전됐다.
 
 
-네 목적:
+지금 에러는 Solace 자체가 아니라 포트 9000 충돌이다.
 
 
+스크린샷 핵심:
 
 
-로컬 PC에 Solace 서버 설치
+ports are not available
+exposing port TCP 0.0.0.0:9000
+bind: Only one usage of each socket address...
 
 
-Docker로 실행
 
+뜻:
 
-localhost에서 운영과 비슷한 환경 구성
 
 
-이후 VPN / Queue / Replay 테스트
 
+이미지 다운로드는 성공
 
 
+컨테이너 생성 직전까지 감
 
-즉 지금은 “내 PC에 Solace Broker 하나 띄우기” 단계다.
 
+그런데 로컬 PC의 9000 포트를 이미 다른 프로그램이 사용 중
 
 
-1단계: Docker Desktop 설치
+그래서 컨테이너 시작 실패
 
 
-먼저 Docker Desktop 설치:
 
 
-공식:
-https://www.docker.com/products/docker-desktop/
+즉 이전의 I/O 에러 단계는 넘겼고, 이제는 단순 포트 충돌 문제다.
 
 
-설치 후 반드시 확인:
+해결 방법
 
 
-docker --version
-docker compose version
+가장 쉬운 건 9000 포트 매핑만 빼고 다시 실행하는 거다.
 
+로컬 테스트에서는 9000이 꼭 필요하지 않은 경우가 많다.
 
 
-CMD 열고 입력.
+먼저 혹시 남은 컨테이너 있으면 지우고:
 
 
-정상 예:
+docker rm -f solace
 
 
-Docker version 27.x.x
-Docker Compose version v2.x.x
 
+그 다음 9000 제거한 명령으로 다시 실행:
 
 
+docker run -d ^
+-p 8080:8080 ^
+-p 55555:55555 ^
+-p 8008:8008 ^
+-p 1883:1883 ^
+-p 8000:8000 ^
+-p 5672:5672 ^
+-p 2222:2222 ^
+--shm-size=2g ^
+--env username_admin_globalaccesslevel=admin ^
+--env username_admin_password=admin ^
+--name=solace ^
+solace/solace-pubsub-standard
 
-2단계: 폴더 만들기
 
 
-예:
+왜 9000 빼도 되냐
 
 
-C:\SolaceDocker
+네가 지금 필요한 건 주로 이쪽이다.
 
 
 
-직접 만들어도 되고 CMD로:
 
+8080 : 웹 관리
 
-mkdir C:\SolaceDocker
-cd C:\SolaceDocker
 
+55555 : Solace 통신
 
 
+2222 : CLI
 
-3단계: docker-compose.yml 만들기
 
+필요 시 5672, 1883, 8008
 
-메모장 열어서 아래 내용 저장:
 
 
-파일명:
 
+일단 VPN 만들고 Queue 만들고 Replay 테스트하는 데는 보통 9000 없이도 시작 가능하다.
 
-docker-compose.yml
 
+혹시 9000을 꼭 써야 하면
 
 
-내용:
+이미 누가 9000 쓰는지 찾아서 죽이거나, 다른 포트로 바꾸면 된다.
 
 
-services:
-  solace:
-    image: solace/solace-pubsub-standard:latest
-    container_name: local-solace
-    shm_size: 1g
-    ulimits:
-      memlock: -1
-      nofile:
-        soft: 2448
-        hard: 6592
-    ports:
-      - "8080:8080"
-      - "55555:55555"
-      - "2222:2222"
-    environment:
-      username_admin_globalaccesslevel: admin
-      username_admin_password: admin
+확인:
 
 
+netstat -ano | findstr :9000
 
 
-4단계: CMD 실행
 
+마지막 PID 확인 후:
 
-이제 CMD 열고:
 
+tasklist | findstr <PID>
 
-cd C:\SolaceDocker
-docker compose up -d
 
 
+강제 종료가 필요하면:
 
-여기서 무슨 일이 일어나냐:
 
+taskkill /PID <PID> /F
 
-처음 실행 시:
 
 
+또는 포트만 바꿔서:
 
 
-Solace 이미지 다운로드
+-p 9001:9000
 
 
-컨테이너 생성
 
+이렇게 써도 된다.
 
-자동 실행
 
+지금 추천
 
 
+지금은 복잡하게 가지 말고 9000 빼고 먼저 띄워라.
 
-처음은 1~3분 걸릴 수 있음.
 
-
-
-5단계: 정상 실행 확인
-
-
-입력:
+띄운 뒤 확인:
 
 
 docker ps
+docker logs solace
 
 
 
-정상 예:
-
-
-CONTAINER ID   IMAGE
-xxxxxx         solace/solace-pubsub-standard
-
-
-
-그리고:
-
-
-docker logs local-solace
-
-
-
-마지막에 이런 느낌 나오면 정상:
-
-
-Primary Virtual Router is Active
-System is ready
-
-
-
-
-6단계: 웹 관리자 접속
-
-
-브라우저 열기:
+그 다음 브라우저로:
 
 
 http://localhost:8080
@@ -191,181 +155,11 @@ http://localhost:8080
 로그인:
 
 
-ID: admin
-PW: admin
+admin / admin
 
 
 
+지금 단계에선 거의 다 왔다.
 
-7단계: 여기까지 되면 설치 완료
-
-
-이 상태면 이미 서버 설치 끝이다.
-
-
-운영 서버랑 동일하게:
-
-
-
-
-SMF 포트 55555 열림
-
-
-관리 콘솔 8080 열림
-
-
-CLI 2222 열림
-
-
-
-
-즉 네 C# 코드에서도 바로 연결 가능:
-
-
-Host = "localhost:55555"
-VPN = "default"
-Username = "admin"
-Password = "admin"
-
-
-
-
-8단계: 서버 중지 / 재시작 방법
-
-
-중지:
-
-
-docker compose down
-
-
-
-재시작:
-
-
-docker compose up -d
-
-
-
-
-9단계: 자주 발생하는 오류
-
-
-
-오류1: docker compose not recognized
-
-
-→ Docker Desktop 설치 안됨
-
-
-
-오류2: port 55555 already in use
-
-
-운영 Solace나 다른 프로세스 사용 중
-
-
-해결:
-
-
-compose 파일 수정:
-
-
-- "55556:55555"
-
-
-
-그러면 접속은:
-
-
-localhost:55556
-
-
-
-
-오류3: localhost:8080 접속 안됨
-
-
-브로커 초기화 중일 수 있음
-
-1분 기다려.
-
-
-
-10단계: 다음 단계
-
-
-설치 끝나면 다음으로:
-
-
-
-
-VPN 생성
-
-
-Queue 생성
-
-
-Replay 활성화
-
-
-C# 연결 테스트
-
-
-
-
-
-핵심 답변
-
-
-네 질문:
-
-
-
-
-cmd 저거 입력하면 끝?
-
-
-
-
-답:
-
-
-맞다.
-정확히는:
-
-
-cd C:\SolaceDocker
-docker compose up -d
-
-
-
-이 명령 한 번이면 서버는 올라간다.
-
-
-
-지금 네가 해야 할 딱 첫 행동
-
-
-
-
-Docker Desktop 설치
-
-
-위 compose 파일 저장
-
-
-CMD에서 실행:
-
-
-
-
-docker compose up -d
-
-
-
-
-설치 끝나면 바로 다음 단계로
-
-“VPN 만들고 Queue 만들기” 이어서 가면 된다.
+다음은 9000 뺀 명령으로 실행하면 된다.
 
