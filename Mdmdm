@@ -72,3 +72,17 @@ if (kind == "Fail")
     if (dashIndex >= 0)
         reason = tmp.Substring(dashIndex + 1).Trim();
 }
+
+
+private bool IsLogLevel(string token)
+{
+    if (string.IsNullOrWhiteSpace(token))
+        return false;
+
+    return token.Equals("info", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("warn", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("warning", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("error", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("debug", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("trace", StringComparison.OrdinalIgnoreCase);
+}
