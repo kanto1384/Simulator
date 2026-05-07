@@ -1,165 +1,74 @@
-이번엔 정상적으로 많이 진전됐다.
-
-
-지금 에러는 Solace 자체가 아니라 포트 9000 충돌이다.
-
-
-스크린샷 핵심:
-
-
-ports are not available
-exposing port TCP 0.0.0.0:9000
-bind: Only one usage of each socket address...
-
-
-
-뜻:
-
-
-
-
-이미지 다운로드는 성공
-
-
-컨테이너 생성 직전까지 감
-
-
-그런데 로컬 PC의 9000 포트를 이미 다른 프로그램이 사용 중
-
-
-그래서 컨테이너 시작 실패
-
-
-
-
-즉 이전의 I/O 에러 단계는 넘겼고, 이제는 단순 포트 충돌 문제다.
-
-
-해결 방법
-
-
-가장 쉬운 건 9000 포트 매핑만 빼고 다시 실행하는 거다.
-
-로컬 테스트에서는 9000이 꼭 필요하지 않은 경우가 많다.
-
-
-먼저 혹시 남은 컨테이너 있으면 지우고:
-
-
-docker rm -f solace
-
-
-
-그 다음 9000 제거한 명령으로 다시 실행:
-
-
-docker run -d ^
--p 8080:8080 ^
--p 55555:55555 ^
--p 8008:8008 ^
--p 1883:1883 ^
--p 8000:8000 ^
--p 5672:5672 ^
--p 2222:2222 ^
---shm-size=2g ^
---env username_admin_globalaccesslevel=admin ^
---env username_admin_password=admin ^
---name=solace ^
-solace/solace-pubsub-standard
-
-
-
-왜 9000 빼도 되냐
-
-
-네가 지금 필요한 건 주로 이쪽이다.
-
-
-
-
-8080 : 웹 관리
-
-
-55555 : Solace 통신
-
-
-2222 : CLI
-
-
-필요 시 5672, 1883, 8008
-
-
-
-
-일단 VPN 만들고 Queue 만들고 Replay 테스트하는 데는 보통 9000 없이도 시작 가능하다.
-
-
-혹시 9000을 꼭 써야 하면
-
-
-이미 누가 9000 쓰는지 찾아서 죽이거나, 다른 포트로 바꾸면 된다.
-
-
-확인:
-
-
-netstat -ano | findstr :9000
-
-
-
-마지막 PID 확인 후:
-
-
-tasklist | findstr <PID>
-
-
-
-강제 종료가 필요하면:
-
-
-taskkill /PID <PID> /F
-
-
-
-또는 포트만 바꿔서:
-
-
--p 9001:9000
-
-
-
-이렇게 써도 된다.
-
-
-지금 추천
-
-
-지금은 복잡하게 가지 말고 9000 빼고 먼저 띄워라.
-
-
-띄운 뒤 확인:
-
-
-docker ps
-docker logs solace
-
-
-
-그 다음 브라우저로:
-
-
-http://localhost:8080
-
-
-
-로그인:
-
-
-admin / admin
-
-
-
-지금 단계에선 거의 다 왔다.
-
-다음은 9000 뺀 명령으로 실행하면 된다.
-
+var tokens = new List<string>();
+string tmp = rest;
+
+var bracketRx = new Regex(@"^\s*\[(?<tok>[^\]]*)\]");
+
+int guard = 0;
+while (guard < 10)
+{
+    var bm = bracketRx.Match(tmp);
+    if (!bm.Success) break;
+
+    tokens.Add(bm.Groups["tok"].Value.Trim());
+
+    tmp = tmp.Substring(bm.Length).TrimStart();
+
+    guard++;
+}
+
+// 로그 레벨 제거
+if (tokens.Count > 0 &&
+    IsLogLevel(tokens[0]))
+{
+    tokens.RemoveAt(0);
+}
+
+string device = null;
+string step = null;
+string varName = null;
+
+foreach (var token in tokens)
+{
+    if (string.IsNullOrWhiteSpace(token))
+        continue;
+
+    if (token.StartsWith("STEP_", StringComparison.OrdinalIgnoreCase))
+    {
+        step = token;
+        continue;
+    }
+
+    if (token.StartsWith("BR", StringComparison.OrdinalIgnoreCase))
+    {
+        varName = token;
+        continue;
+    }
+
+    if (device == null)
+    {
+        device = token;
+    }
+}
+
+if (string.IsNullOrEmpty(device))
+{
+    var n = Path.GetFileNameWithoutExtension(file);
+    var cut = n.LastIndexOf('_');
+    device = cut > 0 ? n.Substring(0, cut) : n;
+}
+
+if (string.IsNullOrEmpty(varName))
+{
+    varName = device ?? "GLOBAL";
+}
+
+var kind = DetectKind(tmp);
+
+string reason = null;
+
+if (kind == "Fail")
+{
+    int dashIndex = tmp.IndexOf('-');
+    if (dashIndex >= 0)
+        reason = tmp.Substring(dashIndex + 1).Trim();
+}
