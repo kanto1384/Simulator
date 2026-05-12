@@ -1,9 +1,99 @@
-var kind = DetectKind(tmp);
+아래 코드만 테스트용으로 바로 반영하세요.
 
-if (kind == ActionKind.Other)
+기준은 End는 성공 판정 아님, Success/Fail만 최종 판정, [BR_...] 단독 로그는 상세 범위 확장용입니다. 지금 로그처럼 Start → Fail → Start → End → Fail → End 구조가 실제로 발생하므로, End에서 닫으면 안 됩니다. 
+
+
+
+1. ParseFileAsync 교체
+
+
+private async Task ParseFileAsync(string file)
 {
-    kind = DetectKind(rest);
+    using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
+    {
+        string line;
+        long idx = 0;
+        var source = Path.GetFileName(file);
+
+        while ((line = await sr.ReadLineAsync()) != null)
+        {
+            var m = headRx.Match(line);
+            if (!m.Success)
+            {
+                idx++;
+                continue;
+            }
+
+            DateTime ts;
+            if (!DateTime.TryParse(m.Groups["dt"].Value, out ts))
+            {
+                idx++;
+                continue;
+            }
+
+            string level = m.Groups["level"].Value;
+            string rest = m.Groups["rest"].Value;
+
+            var tokens = new List<string>();
+            string tmp = rest;
+            int guard = 0;
+
+            while (guard < 8)
+            {
+                var bm = bracketRx.Match(tmp);
+                if (!bm.Success)
+                    break;
+
+                tokens.Add((bm.Groups["tok"].Value ?? "").Trim());
+                tmp = tmp.Substring(bm.Length).TrimStart();
+
+                guard++;
+            }
+
+            string device = GetDeviceFromFileName(file);
+            string varName = PickVarFromTokens(tokens);
+
+            if (string.IsNullOrWhiteSpace(varName))
+                varName = device ?? "GLOBAL";
+
+            // 1차: 대괄호 헤더를 제거한 뒤 남은 문자열 기준
+            var kind = DetectKind(tmp);
+
+            // 2차: Fail처럼 뒤쪽에 붙는 케이스 보조 판단
+            if (kind == ActionKind.Other)
+                kind = DetectKind(rest);
+
+            bool isOne =
+                (kind == ActionKind.Start) &&
+                !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase);
+
+            lock (locker)
+            {
+                rows.Add(new LogRow
+                {
+                    Timestamp = ts,
+                    Level = level,
+                    Device = device,
+                    Var = varName,
+                    SourceFile = source,
+                    LineIndex = idx,
+                    IsOneLiner = isOne,
+                    Kind = kind,
+                    Var_ = rest
+                });
+            }
+
+            idx++;
+        }
+    }
 }
+
+
+
+
+2. DetectKind 교체
+
 
 private ActionKind DetectKind(string text)
 {
@@ -12,20 +102,15 @@ private ActionKind DetectKind(string text)
 
     text = text.Trim();
 
-    // Fail은 어디에 있어도 잡아야 함
+    // Fail은 뒤쪽에 붙어도 잡아야 함
     if (Regex.IsMatch(text, @"\bFail\b", RegexOptions.IgnoreCase))
         return ActionKind.Fail;
 
     if (Regex.IsMatch(text, @"ACK\s*=\s*NG", RegexOptions.IgnoreCase))
         return ActionKind.Fail;
 
-    if (Regex.IsMatch(text, @"BizRule\s+Exception", RegexOptions.IgnoreCase))
-        return ActionKind.Fail;
-
-    if (Regex.IsMatch(text, @"\bException\b", RegexOptions.IgnoreCase))
-        return ActionKind.Fail;
-
-    // Success / End / Start는 오탐 방지를 위해 앞쪽 기준
+    // Success / End / Start는 앞쪽 기준만 허용
+    // JOB_START, Request Start Time 같은 오탐 방지
     if (text.StartsWith("Success", StringComparison.OrdinalIgnoreCase))
         return ActionKind.Success;
 
@@ -37,3 +122,242 @@ private ActionKind DetectKind(string text)
 
     return ActionKind.Other;
 }
+
+
+
+
+3. BuildMergedQueue 교체
+
+
+private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
+{
+    var result = new List<CombinedRow>();
+    var queues = new Dictionary<string, Queue<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var r in ordered)
+    {
+        if (string.IsNullOrEmpty(r.Var) || !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        Queue<CombinedRow> q;
+        if (!queues.TryGetValue(r.Var, out q))
+        {
+            q = new Queue<CombinedRow>();
+            queues[r.Var] = q;
+        }
+
+        if (r.Kind == ActionKind.Start)
+        {
+            // 같은 BR의 이전 Start가 Success/Fail 없이 남아 있으면 NG 처리
+            while (q.Count > 0)
+            {
+                var old = q.Dequeue();
+
+                if (!old.EndTs.HasValue)
+                {
+                    old.EndTs = r.Timestamp;
+                    old.EndIdx = (int)r.LineIndex;
+                }
+
+                old.Status = "NG";
+                old.DurationSeconds = Math.Max(0, Math.Round((old.EndTs.Value - old.StartTs).TotalSeconds, 3));
+
+                result.Add(old);
+            }
+
+            q.Enqueue(new CombinedRow
+            {
+                Var = r.Var,
+                StartTs = r.Timestamp,
+                Status = "Unknown",
+                SourceFile = r.SourceFile,
+                StartIdx = (int)r.LineIndex,
+                EndIdx = -1,
+                SuccessIdx = -1
+            });
+        }
+        else if (r.Kind == ActionKind.Success)
+        {
+            // Start 없는 Success는 무시
+            if (q.Count == 0)
+                continue;
+
+            var cur = q.Dequeue();
+
+            cur.SuccessTs = r.Timestamp;
+            cur.SuccessIdx = (int)r.LineIndex;
+            cur.EndTs = r.Timestamp;
+            cur.EndIdx = (int)r.LineIndex;
+            cur.Status = "Success";
+            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
+            if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
+            {
+                if (kvIndexByFile.TryGetValue(cur.SourceFile, out var fileMap) &&
+                    fileMap.TryGetValue(cur.SuccessIdx, out var pairs))
+                {
+                    cur.MLot = PickLotFromPairs(cur.Var, pairs);
+                }
+            }
+
+            result.Add(cur);
+        }
+        else if (r.Kind == ActionKind.Fail)
+        {
+            if (q.Count > 0)
+            {
+                // Fail이 최종 NG 판정
+                var cur = q.Dequeue();
+
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.Status = "NG";
+                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
+                result.Add(cur);
+            }
+            else
+            {
+                // Start 없이 Fail만 나온 경우도 NG로 표시
+                result.Add(new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "NG",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0
+                });
+            }
+        }
+        else if (r.Kind == ActionKind.End)
+        {
+            // End는 성공 판정 아님.
+            // 현재 열린 Start의 상세 범위만 확장.
+            if (q.Count == 0)
+                continue;
+
+            var cur = q.Peek();
+
+            cur.EndTs = r.Timestamp;
+            cur.EndIdx = (int)r.LineIndex;
+            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+        }
+        else if (r.Kind == ActionKind.Other)
+        {
+            // [BR_...] 단독 로그, Solas 전송 로그 등
+            // 판정하지 않고 상세 범위만 확장
+            if (q.Count == 0)
+                continue;
+
+            var cur = q.Peek();
+
+            cur.EndTs = r.Timestamp;
+            cur.EndIdx = (int)r.LineIndex;
+            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+        }
+    }
+
+    // 파일 끝까지 Success/Fail 없이 남은 Start는 NG
+    foreach (var kv in queues)
+    {
+        var q = kv.Value;
+
+        while (q.Count > 0)
+        {
+            var cur = q.Dequeue();
+
+            if (!cur.EndTs.HasValue)
+            {
+                cur.EndTs = cur.StartTs;
+                cur.EndIdx = cur.StartIdx;
+            }
+
+            cur.Status = "NG";
+            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
+            result.Add(cur);
+        }
+    }
+
+    return result.OrderBy(x => x.StartTs).ToList();
+}
+
+
+
+
+4. 헬퍼 메서드 추가
+
+
+같은 클래스 내부에 추가하세요. 기존에 있으면 중복 추가하지 말고 교체하세요.
+
+
+private string PickVarFromTokens(List<string> tokens)
+{
+    if (tokens == null || tokens.Count == 0)
+        return null;
+
+    // BR_ 토큰 우선
+    var br = tokens.FirstOrDefault(t =>
+        !string.IsNullOrWhiteSpace(t) &&
+        t.Trim().StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
+
+    if (!string.IsNullOrWhiteSpace(br))
+        return br.Trim();
+
+    // BR_이 없으면 빈값, STEP_ 제외 후 마지막 유효 토큰
+    var valid = tokens
+        .Select(t => (t ?? "").Trim())
+        .Where(t => !string.IsNullOrWhiteSpace(t))
+        .Where(t => !t.StartsWith("STEP_", StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    if (valid.Count > 0)
+        return valid.Last();
+
+    return null;
+}
+
+private string GetDeviceFromFileName(string file)
+{
+    var n = Path.GetFileNameWithoutExtension(file);
+    var cut = n.LastIndexOf('_');
+
+    return cut > 0 ? n.Substring(0, cut) : n;
+}
+
+
+
+
+적용 후 기대 결과
+
+
+이 흐름이면:
+
+
+Start
+Fail
+Start
+End
+Fail
+End
+
+
+
+결과는 이렇게 나와야 합니다.
+
+
+Start ~ Fail = NG
+Start ~ Fail = NG
+마지막 End = 무시
+
+
+
+End만 보고 Success로 찍히는 문제는 없어집니다.
+
