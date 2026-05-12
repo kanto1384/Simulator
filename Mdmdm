@@ -1,6 +1,21 @@
-아래 코드만 반영하세요.
+맞습니다. 내가 판단해서 SuccessIdx = -1로 죽이면 안 됩니다.
 
-핵심은 Unknown 유지 + JSON 동적 컬럼 유지 + 기존 Start/Success/End 패턴 유지입니다. THICK_NG_SECTION처럼 Start/End/Fail이 섞이는 로그와, THICK_SCAN_AVG처럼 Start/Success/End가 반복되는 로그가 같이 있으니 End=Success로 단정하면 안 됩니다.
+표시되는 모든 Row는 JSON/LOT 기준 인덱스를 반드시 가져야 합니다.
+
+
+아래 코드로 가세요.
+
+
+기준:
+
+
+Success → SuccessIdx = Success 라인
+NG      → SuccessIdx = Fail 라인
+Unknown → SuccessIdx = End 라인, 없으면 Start 라인
+
+
+
+gridMerged_CellFormatting이 SuccessIdx로 kvIndexByFile을 조회하는 구조라서, 모든 표시 Row에 SuccessIdx를 넣어야 JSON 동적 컬럼이 살아납니다. 기존 소스도 SuccessIdx를 기준으로 동적 컬럼 값을 가져오는 구조입니다. 
 
 
 1. BuildMergedQueue() 전체 교체
@@ -33,7 +48,8 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 SourceFile = r.SourceFile,
                 StartIdx = (int)r.LineIndex,
                 EndIdx = -1,
-                SuccessIdx = -1
+                SuccessIdx = -1,
+                MLot = ""
             });
         }
         else if (r.Kind == ActionKind.Success)
@@ -44,16 +60,17 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             var cur = q.Peek();
 
             cur.SuccessTs = r.Timestamp;
-            cur.SuccessIdx = (int)r.LineIndex;   // JSON 동적 컬럼 기준
+            cur.SuccessIdx = (int)r.LineIndex;   // JSON/LOT 기준
             cur.EndTs = r.Timestamp;
             cur.EndIdx = (int)r.LineIndex;
             cur.Status = "Success";
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            FillLotIfPossible(cur);
+            FillLotByIndex(cur);
 
-            // Success만으로는 result.Add 하지 않음.
-            // 기존 정상 패턴 Start Start Success End Success End 때문에 End에서 닫음.
+            // 기존 정상 패턴:
+            // Start Start Success End Success End
+            // 때문에 Success에서 바로 Add 하지 않고 End에서 닫음
         }
         else if (r.Kind == ActionKind.End)
         {
@@ -68,20 +85,19 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
             if (cur.Status == "Success")
             {
-                // SuccessIdx는 기존 Success 라인 유지
-                FillLotIfPossible(cur);
+                // SuccessIdx는 Success 라인 유지
+                FillLotByIndex(cur);
                 result.Add(cur);
             }
             else
             {
-                // Start + End만 있는 경우
-                // 작업 흔적은 있으므로 Unknown 표시
-                // JSON/동적 컬럼 기준으로 End 라인을 넣음
+                // Start + End만 있는 경우도 작업 흔적이므로 Unknown 표시
+                // JSON/LOT도 보여야 하므로 End 라인을 기준으로 넣음
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON/LOT 기준
                 cur.Status = "Unknown";
 
-                FillLotIfPossible(cur);
+                FillLotByIndex(cur);
                 result.Add(cur);
             }
         }
@@ -92,18 +108,18 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 var cur = q.Dequeue();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;   // JSON 동적 컬럼 기준
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON/LOT 기준
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "NG";
                 cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-                FillLotIfPossible(cur);
+                FillLotByIndex(cur);
                 result.Add(cur);
             }
             else
             {
-                // Start 없이 Fail만 나온 경우도 NG로 표시
+                // Start 없이 Fail만 나온 경우도 NG 표시
                 var failRow = new CombinedRow
                 {
                     Var = r.Var,
@@ -114,23 +130,23 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                     SourceFile = r.SourceFile,
                     StartIdx = (int)r.LineIndex,
                     EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,   // JSON 동적 컬럼 기준
-                    DurationSeconds = 0
+                    SuccessIdx = (int)r.LineIndex,   // JSON/LOT 기준
+                    DurationSeconds = 0,
+                    MLot = ""
                 };
 
-                FillLotIfPossible(failRow);
+                FillLotByIndex(failRow);
                 result.Add(failRow);
             }
         }
         else
         {
-            // Other는 판정에 사용하지 않음
-            // [BR_...] 단독 로그로 큐를 건드리면 기존 정상 패턴이 깨질 수 있음
+            // Other는 판정에는 사용하지 않음
             continue;
         }
     }
 
-    // 남은 Start도 작업 흔적이므로 Unknown으로 표시
+    // 남은 Start도 Unknown으로 표시
     foreach (var kv in queues)
     {
         var q = kv.Value;
@@ -146,11 +162,11 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             }
 
             cur.SuccessTs = cur.EndTs;
-            cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;   // JSON 동적 컬럼 기준
+            cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;   // JSON/LOT 기준
             cur.Status = "Unknown";
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            FillLotIfPossible(cur);
+            FillLotByIndex(cur);
             result.Add(cur);
         }
     }
@@ -166,7 +182,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 같은 클래스 안에 추가하세요.
 
 
-private void FillLotIfPossible(CombinedRow row)
+private void FillLotByIndex(CombinedRow row)
 {
     if (row == null)
         return;
@@ -186,52 +202,51 @@ private void FillLotIfPossible(CombinedRow row)
 
 
 
-3. GridMerged_RowPrePaint() 조건 교체
+3. 기존에 넣었던 것 제거
 
 
-Unknown도 확인 가능하게 색상 처리합니다.
+아래 함수/호출을 넣어놨으면 제거하세요.
 
 
-private void GridMerged_RowPrePaint(object sender, DataGridViewRowPrePaintEventArgs e)
+PickLotFromRange(...)
+FillLotIfPossible(...)
+
+
+
+그리고 이런 식으로 SuccessIdx = -1을 넣는 코드도 제거하세요.
+
+
+cur.SuccessIdx = -1;
+
+
+
+4. Unknown 색상 표시
+
+
+GridMerged_RowPrePaint()는 이 조건으로 두세요.
+
+
+if ((row.DurationSeconds.HasValue && row.DurationSeconds.Value >= th) ||
+    row.Status == "NG" ||
+    row.Status == "Unknown")
 {
-    if (e.RowIndex < 0 || e.RowIndex >= gridMerged.Rows.Count)
-        return;
-
-    if (gridMerged.Rows[e.RowIndex].IsNewRow)
-        return;
-
-    var row = gridMerged.Rows[e.RowIndex].DataBoundItem as CombinedRow;
-    if (row == null)
-        return;
-
-    var th = (double)numThreshold.Value;
-
-    if ((row.DurationSeconds.HasValue && row.DurationSeconds.Value >= th) ||
-        row.Status == "NG" ||
-        row.Status == "Unknown")
-    {
-        gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 220, 220);
-    }
-    else
-    {
-        gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.White;
-    }
+    gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 220, 220);
+}
+else
+{
+    gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.White;
 }
 
 
 
-최종 상태 기준:
+이제 표시되는 행은 전부 SuccessIdx가 들어갑니다.
 
 
-Start + Success + End  → Success
-Start + End            → Unknown
-Start만 남음           → Unknown
-Start + Fail           → NG
-Fail 단독              → NG
-Success 단독           → 무시
-End 단독               → 무시
+Success → Success 라인 기준으로 JSON/LOT 표시
+NG      → Fail 라인 기준으로 JSON/LOT 표시
+Unknown → End 라인 또는 Start 라인 기준으로 JSON/LOT 표시
 
 
 
-SuccessIdx는 모든 표시 행에 채워지므로 JSON 동적 컬럼도 다시 펼쳐져야 합니다.
+즉, “데이터가 있으면 다 뜨게” 하는 방식입니다.
 
