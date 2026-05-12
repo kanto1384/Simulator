@@ -1,193 +1,17 @@
-내가 더 건드리면 안 되는 부분까지 건드린 게 문제였습니다.
+맞습니다. Success는 End가 없어도 사라지면 안 됩니다.
 
-이번 코드는 JSON/LOT 관련 기존 함수는 건드리지 않고, 아래 메서드만 기준으로 다시 맞추는 버전입니다.
+기존 FIFO 의도는 Start → Success만 와도 Success로 살아 있어야 하고, 나중에 End가 오면 같은 Row의 End 시간만 보정되는 구조여야 합니다.
 
 
-건드리지 말 것
+아래 코드로 BuildMergedQueue()만 다시 교체하세요.
 
-
-BuildKVIndexForFile
-PickLotFromPairs
-UpdateDynamicColumnsForSearch
-gridMerged_CellFormatting
-
-
-
-아래 코드만 반영하세요. 원본 코드의 kvIndexByFile, SuccessIdx, PickLotFromPairs 구조는 그대로 살리는 방향입니다. 
-
-
-
-1. bracketRx 확인
-
-
-이건 빈 [] 때문에 아래 상태여야 합니다.
-
-
-readonly Regex bracketRx = new Regex(@"^\s*\[(?<tok>[^\]]*)\]", RegexOptions.Compiled);
-
-
-
-
-2. ParseFileAsync 전체 교체
-
-
-private async Task ParseFileAsync(string file)
-{
-    using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
-    {
-        string line;
-        long idx = 0;
-        var source = Path.GetFileName(file);
-
-        while ((line = await sr.ReadLineAsync()) != null)
-        {
-            var m = headRx.Match(line);
-            if (!m.Success)
-            {
-                idx++;
-                continue;
-            }
-
-            DateTime ts;
-            if (!DateTime.TryParse(m.Groups["dt"].Value, out ts))
-            {
-                idx++;
-                continue;
-            }
-
-            string level = m.Groups["level"].Value;
-            string rest = m.Groups["rest"].Value;
-
-            var tokens = new List<string>();
-            string tmp = rest;
-            int guard = 0;
-
-            while (guard < 10)
-            {
-                var bm = bracketRx.Match(tmp);
-                if (!bm.Success)
-                    break;
-
-                tokens.Add((bm.Groups["tok"].Value ?? "").Trim());
-                tmp = tmp.Substring(bm.Length).TrimStart();
-
-                guard++;
-            }
-
-            string device = GetDeviceFromFileName(file);
-            string varName = PickVarFromTokens(tokens);
-
-            if (string.IsNullOrWhiteSpace(varName))
-                varName = device ?? "GLOBAL";
-
-            var kind = DetectKind(tmp);
-
-            // Fail - 사유처럼 뒤쪽에 붙은 케이스 보조 감지
-            if (kind == ActionKind.Other)
-                kind = DetectKind(rest);
-
-            bool isOne =
-                (kind == ActionKind.Start) &&
-                !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase);
-
-            lock (locker)
-            {
-                rows.Add(new LogRow
-                {
-                    Timestamp = ts,
-                    Level = level,
-                    Device = device,
-                    Var = varName,
-                    SourceFile = source,
-                    LineIndex = idx,
-                    IsOneLiner = isOne,
-                    Kind = kind,
-                    Var_ = rest
-                });
-            }
-
-            idx++;
-        }
-    }
-}
-
-
-
-
-3. GetVarFromHeader 전체 교체
-
-
-private string GetVarFromHeader(string sourceFile, string rest)
-{
-    var tokens = new List<string>();
-    string tmp = rest ?? "";
-    int guard = 0;
-
-    while (guard < 10)
-    {
-        var m = bracketRx.Match(tmp);
-        if (!m.Success)
-            break;
-
-        tokens.Add((m.Groups["tok"].Value ?? "").Trim());
-        tmp = tmp.Substring(m.Length).TrimStart();
-
-        guard++;
-    }
-
-    string varName = PickVarFromTokens(tokens);
-
-    if (!string.IsNullOrWhiteSpace(varName))
-        return varName;
-
-    var device = GetDeviceFromFileName(sourceFile);
-    return device ?? "GLOBAL";
-}
-
-
-
-
-4. DetectKind 전체 교체
-
-
-private ActionKind DetectKind(string text)
-{
-    if (string.IsNullOrWhiteSpace(text))
-        return ActionKind.Other;
-
-    text = text.Trim();
-
-    // Fail은 사유와 같이 붙어오므로 전체 검색 허용
-    if (Regex.IsMatch(text, @"\bFail\b", RegexOptions.IgnoreCase))
-        return ActionKind.Fail;
-
-    if (Regex.IsMatch(text, @"ACK\s*=\s*NG", RegexOptions.IgnoreCase))
-        return ActionKind.Fail;
-
-    // Start/Success/End는 오탐 방지 위해 앞쪽 기준만 허용
-    // JOB_START, Request Start Time 같은 문자열 오탐 방지
-    if (text.StartsWith("Success", StringComparison.OrdinalIgnoreCase))
-        return ActionKind.Success;
-
-    if (text.StartsWith("End", StringComparison.OrdinalIgnoreCase))
-        return ActionKind.End;
-
-    if (text.StartsWith("Start", StringComparison.OrdinalIgnoreCase))
-        return ActionKind.Start;
-
-    return ActionKind.Other;
-}
-
-
-
-
-5. BuildMergedQueue 전체 교체
+BuildKVIndexForFile, PickLotFromPairs, UpdateDynamicColumnsForSearch, gridMerged_CellFormatting은 건드리지 마세요. 기존 동적 컬럼은 SuccessIdx 기준으로 kvIndexByFile을 조회하는 구조라 이쪽을 건드리면 LOT/JSON이 깨집니다. 
 
 
 private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 {
     var result = new List<CombinedRow>();
+    var added = new HashSet<CombinedRow>(); // 같은 객체 중복 Add 방지
     var queues = new Dictionary<string, Queue<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
 
     foreach (var r in ordered)
@@ -223,7 +47,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 var cur = q.Peek();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;
+                cur.SuccessIdx = (int)r.LineIndex; // 기존 JSON/LOT 기준
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "Success";
@@ -231,13 +55,18 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 FillLotByIndex(cur);
 
-                // 기존 정상 패턴 보존:
-                // Start Start Success End Success End
-                // Success에서 바로 Add 하지 않고 End에서 닫음
+                // 중요:
+                // End가 없어도 Success는 화면에 떠야 함.
+                // 나중에 End가 오면 같은 객체의 EndTs/EndIdx만 갱신됨.
+                if (!added.Contains(cur))
+                {
+                    result.Add(cur);
+                    added.Add(cur);
+                }
             }
             else
             {
-                // Start 없이 Success만 있는 로그도 사실 그대로 표시
+                // Start 없이 Success만 있는 경우도 실제 로그이므로 표시
                 var row = new CombinedRow
                 {
                     Var = r.Var,
@@ -255,13 +84,14 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 FillLotByIndex(row);
                 result.Add(row);
+                added.Add(row);
             }
         }
         else if (r.Kind == ActionKind.End)
         {
             if (q.Count > 0)
             {
-                var cur = q.Dequeue();
+                var cur = q.Peek();
 
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
@@ -269,25 +99,38 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 if (cur.Status == "Success")
                 {
+                    // Success가 이미 있던 건은 End에서 FIFO 종료만 처리
+                    q.Dequeue();
+
                     // SuccessIdx는 Success 라인 유지
                     FillLotByIndex(cur);
-                    result.Add(cur);
+
+                    if (!added.Contains(cur))
+                    {
+                        result.Add(cur);
+                        added.Add(cur);
+                    }
                 }
                 else
                 {
-                    // Start + End만 있는 경우
-                    // 작업 흔적은 있으므로 Unknown 표시
+                    // Start + End만 있는 경우는 Unknown으로 표시
+                    q.Dequeue();
+
                     cur.Status = "Unknown";
                     cur.SuccessTs = r.Timestamp;
-                    cur.SuccessIdx = (int)r.LineIndex; // JSON/LOT 조회 기준
-
+                    cur.SuccessIdx = (int)r.LineIndex; // Unknown의 JSON/LOT 기준은 End 라인
                     FillLotByIndex(cur);
-                    result.Add(cur);
+
+                    if (!added.Contains(cur))
+                    {
+                        result.Add(cur);
+                        added.Add(cur);
+                    }
                 }
             }
             else
             {
-                // End 단독도 사실 그대로 표시
+                // End 단독도 실제 로그이므로 Unknown 표시
                 var row = new CombinedRow
                 {
                     Var = r.Var,
@@ -305,6 +148,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 FillLotByIndex(row);
                 result.Add(row);
+                added.Add(row);
             }
         }
         else if (r.Kind == ActionKind.Fail)
@@ -314,18 +158,23 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 var cur = q.Dequeue();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex; // JSON/LOT 조회 기준
+                cur.SuccessIdx = (int)r.LineIndex; // NG의 JSON/LOT 기준은 Fail 라인
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "NG";
                 cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
                 FillLotByIndex(cur);
-                result.Add(cur);
+
+                if (!added.Contains(cur))
+                {
+                    result.Add(cur);
+                    added.Add(cur);
+                }
             }
             else
             {
-                // Fail 단독도 사실 그대로 표시
+                // Fail 단독도 실제 로그이므로 NG 표시
                 var row = new CombinedRow
                 {
                     Var = r.Var,
@@ -343,6 +192,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 FillLotByIndex(row);
                 result.Add(row);
+                added.Add(row);
             }
         }
         else
@@ -359,7 +209,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             }
             else
             {
-                // 단독 BR 로그도 사실 그대로 Unknown 표시
+                // 단독 BR 로그도 실제 로그이므로 Unknown 표시
                 var row = new CombinedRow
                 {
                     Var = r.Var,
@@ -377,11 +227,12 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 FillLotByIndex(row);
                 result.Add(row);
+                added.Add(row);
             }
         }
     }
 
-    // 남은 Start도 작업 흔적이므로 Unknown 표시
+    // 남은 Start 처리
     foreach (var kv in queues)
     {
         var q = kv.Value;
@@ -392,62 +243,45 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
             if (!cur.EndTs.HasValue)
             {
-                cur.EndTs = cur.StartTs;
-                cur.EndIdx = cur.StartIdx;
+                cur.EndTs = cur.SuccessTs ?? cur.StartTs;
+                cur.EndIdx = cur.SuccessIdx >= 0 ? cur.SuccessIdx : cur.StartIdx;
             }
 
-            cur.SuccessTs = cur.EndTs;
-            cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
-            cur.Status = cur.Status == "Success" ? "Success" : "Unknown";
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            FillLotByIndex(cur);
-            result.Add(cur);
+            if (cur.Status == "Success")
+            {
+                // Start + Success만 있고 End가 없어도 Success 유지
+                if (cur.SuccessIdx < 0)
+                    cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
+
+                FillLotByIndex(cur);
+            }
+            else
+            {
+                // Start만 남은 건은 Unknown
+                cur.Status = "Unknown";
+                cur.SuccessTs = cur.EndTs;
+                cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
+
+                FillLotByIndex(cur);
+            }
+
+            if (!added.Contains(cur))
+            {
+                result.Add(cur);
+                added.Add(cur);
+            }
         }
     }
 
-    // 중복 제거 금지
-    // 실제 로그 기준으로 그대로 보여줌
     return result.OrderBy(x => x.StartTs).ThenBy(x => x.StartIdx).ToList();
 }
 
 
 
+FillLotByIndex() 없으면 이거만 추가하세요.
 
-6. 헬퍼 메서드 추가
-
-
-private string PickVarFromTokens(List<string> tokens)
-{
-    if (tokens == null || tokens.Count == 0)
-        return null;
-
-    var br = tokens.FirstOrDefault(t =>
-        !string.IsNullOrWhiteSpace(t) &&
-        t.Trim().StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
-
-    if (!string.IsNullOrWhiteSpace(br))
-        return br.Trim();
-
-    var valid = tokens
-        .Select(t => (t ?? "").Trim())
-        .Where(t => !string.IsNullOrWhiteSpace(t))
-        .Where(t => !t.StartsWith("STEP_", StringComparison.OrdinalIgnoreCase))
-        .ToList();
-
-    if (valid.Count > 0)
-        return valid.Last();
-
-    return null;
-}
-
-private string GetDeviceFromFileName(string file)
-{
-    var n = Path.GetFileNameWithoutExtension(file);
-    var cut = n.LastIndexOf('_');
-
-    return cut > 0 ? n.Substring(0, cut) : n;
-}
 
 private void FillLotByIndex(CombinedRow row)
 {
@@ -469,51 +303,16 @@ private void FillLotByIndex(CombinedRow row)
 
 
 
+핵심 변경점은 이겁니다.
 
-7. GridMerged_RowPrePaint는 이 상태로
 
-
-private void GridMerged_RowPrePaint(object sender, DataGridViewRowPrePaintEventArgs e)
-{
-    if (e.RowIndex < 0 || e.RowIndex >= gridMerged.Rows.Count)
-        return;
-
-    if (gridMerged.Rows[e.RowIndex].IsNewRow)
-        return;
-
-    var row = gridMerged.Rows[e.RowIndex].DataBoundItem as CombinedRow;
-    if (row == null)
-        return;
-
-    var th = (double)numThreshold.Value;
-
-    if ((row.DurationSeconds.HasValue && row.DurationSeconds.Value >= th) ||
-        row.Status == "NG" ||
-        row.Status == "Unknown")
-    {
-        gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 220, 220);
-    }
-    else
-    {
-        gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.White;
-    }
-}
+Success에서 result.Add 한다.
+End가 없어도 Success를 유지한다.
+End가 오면 같은 객체를 업데이트만 한다.
+FIFO 큐는 End/Fail에서만 Dequeue 한다.
+중복 제거는 하지 않는다.
 
 
 
-
-적용 전 삭제해야 할 것
-
-
-내가 앞에서 줬던 아래 함수들이 들어가 있으면 제거하세요.
-
-
-ExtractKeyValuePairsFromBlock(...)
-PickLotFromRange(...)
-FillLotIfPossible(...)
-DedupKeepLastRow(...)
-
-
-
-그리고 BuildKVIndexForFile, PickLotFromPairs, UpdateDynamicColumnsForSearch, gridMerged_CellFormatting은 원래 코드로 두세요.
+이제 Start → Success만 있어도 Success가 사라지지 않습니다.
 
