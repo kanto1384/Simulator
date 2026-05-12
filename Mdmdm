@@ -1,146 +1,33 @@
-맞습니다. 지금은 되돌리기 기준 코드가 필요합니다.
-
-아래 순서대로 바꾸세요.
+맞습니다. 지금처럼 로그가 통합되어 있지 않으면 닫히지 않은 Start를 NG로 강제 표시하면 안 됩니다.
 
 
-핵심 기준은 이겁니다.
+현재 문제는 이겁니다.
 
 
-Start → 큐에 쌓음
-Success → 현재 큐 맨 앞 건에 Success 표시만 함
-End → Success 표시된 건만 최종 닫음
-Fail → 현재 큐 맨 앞 건을 NG로 닫음
-Other → 판정에는 사용하지 않음
+Start만 있고 Success/Fail이 없는 미완료 건
+→ 전부 NG로 화면에 표시됨
+→ 이상한 로그들이 한곳에 몰림
 
 
 
-이렇게 해야 정상 패턴인 Start → Start → Success → End → Success → End도 살고, 문제 패턴인 Start → Fail → Start → End → Fail → End도 처리됩니다. 실제 로그에서 THICK_SCAN_AVG는 Start/Success 구조가 있고, THICK_NG_SECTION은 Fail 로그가 따로 찍히는 구조입니다.  
+그래서 기준을 바꿔야 합니다.
+
+
+Success 있음 → Success 표시
+Fail 있음    → NG 표시
+Start만 있음 → 표시하지 않음
+End만 있음   → 표시하지 않음
 
 
 
-1. ParseFileAsync 전체 교체
-
-
-private async Task ParseFileAsync(string file)
-{
-    using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
-    {
-        string line;
-        long idx = 0;
-        var source = Path.GetFileName(file);
-
-        while ((line = await sr.ReadLineAsync()) != null)
-        {
-            var m = headRx.Match(line);
-            if (!m.Success)
-            {
-                idx++;
-                continue;
-            }
-
-            DateTime ts;
-            if (!DateTime.TryParse(m.Groups["dt"].Value, out ts))
-            {
-                idx++;
-                continue;
-            }
-
-            string level = m.Groups["level"].Value;
-            string rest = m.Groups["rest"].Value;
-
-            var tokens = new List<string>();
-            string tmp = rest;
-            int guard = 0;
-
-            while (guard < 8)
-            {
-                var bm = bracketRx.Match(tmp);
-                if (!bm.Success)
-                    break;
-
-                tokens.Add((bm.Groups["tok"].Value ?? "").Trim());
-                tmp = tmp.Substring(bm.Length).TrimStart();
-
-                guard++;
-            }
-
-            string device = GetDeviceFromFileName(file);
-            string varName = PickVarFromTokens(tokens);
-
-            if (string.IsNullOrWhiteSpace(varName))
-                varName = device ?? "GLOBAL";
-
-            var kind = DetectKind(tmp);
-
-            if (kind == ActionKind.Other)
-                kind = DetectKind(rest);
-
-            bool isOne =
-                (kind == ActionKind.Start) &&
-                !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase);
-
-            lock (locker)
-            {
-                rows.Add(new LogRow
-                {
-                    Timestamp = ts,
-                    Level = level,
-                    Device = device,
-                    Var = varName,
-                    SourceFile = source,
-                    LineIndex = idx,
-                    IsOneLiner = isOne,
-                    Kind = kind,
-                    Var_ = rest
-                });
-            }
-
-            idx++;
-        }
-    }
-}
+즉, 명확하게 완료된 건만 화면에 표시해야 합니다.
 
 
 
-
-2. DetectKind 전체 교체
-
-
-private ActionKind DetectKind(string text)
-{
-    if (string.IsNullOrWhiteSpace(text))
-        return ActionKind.Other;
-
-    text = text.Trim();
-
-    if (Regex.IsMatch(text, @"\bFail\b", RegexOptions.IgnoreCase))
-        return ActionKind.Fail;
-
-    if (Regex.IsMatch(text, @"ACK\s*=\s*NG", RegexOptions.IgnoreCase))
-        return ActionKind.Fail;
-
-    if (text.StartsWith("Success", StringComparison.OrdinalIgnoreCase))
-        return ActionKind.Success;
-
-    if (text.StartsWith("End", StringComparison.OrdinalIgnoreCase))
-        return ActionKind.End;
-
-    if (text.StartsWith("Start", StringComparison.OrdinalIgnoreCase))
-        return ActionKind.Start;
-
-    return ActionKind.Other;
-}
+1. BuildMergedQueue만 다시 교체하세요
 
 
-
-
-3. BuildMergedQueue 전체 교체
-
-
-이게 핵심입니다.
-
-이전처럼 Start가 또 들어왔다고 기존 큐를 NG로 닫지 않습니다.
+아래 버전은 미완료 Start를 NG로 만들지 않습니다.
 
 
 private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
@@ -196,8 +83,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 }
             }
 
-            // 여기서 result.Add 하지 않음.
-            // End가 오면 최종 닫음.
+            // Success만으로 바로 표시하지 않고 End까지 기다림
         }
         else if (r.Kind == ActionKind.End)
         {
@@ -210,15 +96,16 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             cur.EndIdx = (int)r.LineIndex;
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            // Success가 찍힌 건만 End에서 최종 종료
+            // Success가 찍힌 건만 End에서 확정 표시
             if (cur.Status == "Success")
             {
                 q.Dequeue();
                 result.Add(cur);
             }
 
-            // Success 없이 End만 있으면 아직 닫지 않음.
-            // 뒤에 Fail이 오면 NG로 닫힘.
+            // Success 없는 End는 보류
+            // 뒤에 Fail이 오면 NG로 닫힘
+            // 끝까지 아무것도 없으면 표시 안 함
         }
         else if (r.Kind == ActionKind.Fail)
         {
@@ -237,6 +124,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             }
             else
             {
+                // Start 없이 Fail만 찍힌 경우만 단독 NG 표시
                 result.Add(new CombinedRow
                 {
                     Var = r.Var,
@@ -252,91 +140,23 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 });
             }
         }
-        else if (r.Kind == ActionKind.Other)
+        else
         {
-            // Other는 판정하지 않음.
-            // [BR_...] 단독 로그 때문에 큐를 건드리면 정상 패턴이 깨질 수 있음.
+            // Other는 병합 판정에 사용하지 않음
             continue;
         }
     }
 
-    // 남은 큐 처리
-    foreach (var kv in queues)
-    {
-        var q = kv.Value;
-
-        while (q.Count > 0)
-        {
-            var cur = q.Dequeue();
-
-            if (!cur.EndTs.HasValue)
-            {
-                cur.EndTs = cur.SuccessTs ?? cur.StartTs;
-                cur.EndIdx = cur.SuccessIdx >= 0 ? cur.SuccessIdx : cur.StartIdx;
-            }
-
-            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
-
-            if (cur.Status == "Success")
-            {
-                result.Add(cur);
-            }
-            else
-            {
-                cur.Status = "NG";
-                result.Add(cur);
-            }
-        }
-    }
-
+    // 중요:
+    // 남은 큐를 NG로 추가하지 않음.
+    // Start만 있고 Success/Fail/End 확정이 없는 건은 화면 표시 제외.
     return result.OrderBy(x => x.StartTs).ToList();
 }
 
 
 
 
-4. 헬퍼 메서드 추가 또는 교체
-
-
-이미 있으면 교체하세요.
-
-
-private string PickVarFromTokens(List<string> tokens)
-{
-    if (tokens == null || tokens.Count == 0)
-        return null;
-
-    var br = tokens.FirstOrDefault(t =>
-        !string.IsNullOrWhiteSpace(t) &&
-        t.Trim().StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
-
-    if (!string.IsNullOrWhiteSpace(br))
-        return br.Trim();
-
-    var valid = tokens
-        .Select(t => (t ?? "").Trim())
-        .Where(t => !string.IsNullOrWhiteSpace(t))
-        .Where(t => !t.StartsWith("STEP_", StringComparison.OrdinalIgnoreCase))
-        .ToList();
-
-    if (valid.Count > 0)
-        return valid.Last();
-
-    return null;
-}
-
-private string GetDeviceFromFileName(string file)
-{
-    var n = Path.GetFileNameWithoutExtension(file);
-    var cut = n.LastIndexOf('_');
-
-    return cut > 0 ? n.Substring(0, cut) : n;
-}
-
-
-
-
-적용 후 기대 결과
+2. 이 버전의 처리 기준
 
 
 정상 패턴:
@@ -380,7 +200,36 @@ End
 
 
 
-지금은 Other로 상세 범위를 확장하지 않는 게 안전합니다.
+미완료 패턴:
 
-그 부분까지 넣으면 정상 케이스에서 범위가 꼬일 가능성이 큽니다.
+
+Start
+End
+
+
+
+결과:
+
+
+표시 안 함
+
+
+
+
+결론
+
+
+지금 로그 구조에서는 미완료 건을 NG로 표시하면 안 됩니다.
+
+
+NG는 아래 경우만 표시하는 게 맞습니다.
+
+
+Fail 있음
+ACK=NG 있음
+Start 없이 Fail 단독 존재
+
+
+
+Start만 있음, End만 있음, Start + End만 있음은 통합 로그가 아니기 때문에 화면에서 제외하는 쪽이 신뢰성이 더 높습니다.
 
