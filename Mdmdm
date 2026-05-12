@@ -1,10 +1,24 @@
-아래 코드만 테스트용으로 바로 반영하세요.
+맞습니다. 지금은 되돌리기 기준 코드가 필요합니다.
 
-기준은 End는 성공 판정 아님, Success/Fail만 최종 판정, [BR_...] 단독 로그는 상세 범위 확장용입니다. 지금 로그처럼 Start → Fail → Start → End → Fail → End 구조가 실제로 발생하므로, End에서 닫으면 안 됩니다. 
+아래 순서대로 바꾸세요.
+
+
+핵심 기준은 이겁니다.
+
+
+Start → 큐에 쌓음
+Success → 현재 큐 맨 앞 건에 Success 표시만 함
+End → Success 표시된 건만 최종 닫음
+Fail → 현재 큐 맨 앞 건을 NG로 닫음
+Other → 판정에는 사용하지 않음
 
 
 
-1. ParseFileAsync 교체
+이렇게 해야 정상 패턴인 Start → Start → Success → End → Success → End도 살고, 문제 패턴인 Start → Fail → Start → End → Fail → End도 처리됩니다. 실제 로그에서 THICK_SCAN_AVG는 Start/Success 구조가 있고, THICK_NG_SECTION은 Fail 로그가 따로 찍히는 구조입니다.  
+
+
+
+1. ParseFileAsync 전체 교체
 
 
 private async Task ParseFileAsync(string file)
@@ -57,10 +71,8 @@ private async Task ParseFileAsync(string file)
             if (string.IsNullOrWhiteSpace(varName))
                 varName = device ?? "GLOBAL";
 
-            // 1차: 대괄호 헤더를 제거한 뒤 남은 문자열 기준
             var kind = DetectKind(tmp);
 
-            // 2차: Fail처럼 뒤쪽에 붙는 케이스 보조 판단
             if (kind == ActionKind.Other)
                 kind = DetectKind(rest);
 
@@ -92,7 +104,7 @@ private async Task ParseFileAsync(string file)
 
 
 
-2. DetectKind 교체
+2. DetectKind 전체 교체
 
 
 private ActionKind DetectKind(string text)
@@ -102,15 +114,12 @@ private ActionKind DetectKind(string text)
 
     text = text.Trim();
 
-    // Fail은 뒤쪽에 붙어도 잡아야 함
     if (Regex.IsMatch(text, @"\bFail\b", RegexOptions.IgnoreCase))
         return ActionKind.Fail;
 
     if (Regex.IsMatch(text, @"ACK\s*=\s*NG", RegexOptions.IgnoreCase))
         return ActionKind.Fail;
 
-    // Success / End / Start는 앞쪽 기준만 허용
-    // JOB_START, Request Start Time 같은 오탐 방지
     if (text.StartsWith("Success", StringComparison.OrdinalIgnoreCase))
         return ActionKind.Success;
 
@@ -126,7 +135,12 @@ private ActionKind DetectKind(string text)
 
 
 
-3. BuildMergedQueue 교체
+3. BuildMergedQueue 전체 교체
+
+
+이게 핵심입니다.
+
+이전처럼 Start가 또 들어왔다고 기존 큐를 NG로 닫지 않습니다.
 
 
 private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
@@ -148,23 +162,6 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
         if (r.Kind == ActionKind.Start)
         {
-            // 같은 BR의 이전 Start가 Success/Fail 없이 남아 있으면 NG 처리
-            while (q.Count > 0)
-            {
-                var old = q.Dequeue();
-
-                if (!old.EndTs.HasValue)
-                {
-                    old.EndTs = r.Timestamp;
-                    old.EndIdx = (int)r.LineIndex;
-                }
-
-                old.Status = "NG";
-                old.DurationSeconds = Math.Max(0, Math.Round((old.EndTs.Value - old.StartTs).TotalSeconds, 3));
-
-                result.Add(old);
-            }
-
             q.Enqueue(new CombinedRow
             {
                 Var = r.Var,
@@ -178,11 +175,10 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         }
         else if (r.Kind == ActionKind.Success)
         {
-            // Start 없는 Success는 무시
             if (q.Count == 0)
                 continue;
 
-            var cur = q.Dequeue();
+            var cur = q.Peek();
 
             cur.SuccessTs = r.Timestamp;
             cur.SuccessIdx = (int)r.LineIndex;
@@ -200,13 +196,34 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 }
             }
 
-            result.Add(cur);
+            // 여기서 result.Add 하지 않음.
+            // End가 오면 최종 닫음.
+        }
+        else if (r.Kind == ActionKind.End)
+        {
+            if (q.Count == 0)
+                continue;
+
+            var cur = q.Peek();
+
+            cur.EndTs = r.Timestamp;
+            cur.EndIdx = (int)r.LineIndex;
+            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
+            // Success가 찍힌 건만 End에서 최종 종료
+            if (cur.Status == "Success")
+            {
+                q.Dequeue();
+                result.Add(cur);
+            }
+
+            // Success 없이 End만 있으면 아직 닫지 않음.
+            // 뒤에 Fail이 오면 NG로 닫힘.
         }
         else if (r.Kind == ActionKind.Fail)
         {
             if (q.Count > 0)
             {
-                // Fail이 최종 NG 판정
                 var cur = q.Dequeue();
 
                 cur.SuccessTs = r.Timestamp;
@@ -220,7 +237,6 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             }
             else
             {
-                // Start 없이 Fail만 나온 경우도 NG로 표시
                 result.Add(new CombinedRow
                 {
                     Var = r.Var,
@@ -236,35 +252,15 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 });
             }
         }
-        else if (r.Kind == ActionKind.End)
-        {
-            // End는 성공 판정 아님.
-            // 현재 열린 Start의 상세 범위만 확장.
-            if (q.Count == 0)
-                continue;
-
-            var cur = q.Peek();
-
-            cur.EndTs = r.Timestamp;
-            cur.EndIdx = (int)r.LineIndex;
-            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
-        }
         else if (r.Kind == ActionKind.Other)
         {
-            // [BR_...] 단독 로그, Solas 전송 로그 등
-            // 판정하지 않고 상세 범위만 확장
-            if (q.Count == 0)
-                continue;
-
-            var cur = q.Peek();
-
-            cur.EndTs = r.Timestamp;
-            cur.EndIdx = (int)r.LineIndex;
-            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+            // Other는 판정하지 않음.
+            // [BR_...] 단독 로그 때문에 큐를 건드리면 정상 패턴이 깨질 수 있음.
+            continue;
         }
     }
 
-    // 파일 끝까지 Success/Fail 없이 남은 Start는 NG
+    // 남은 큐 처리
     foreach (var kv in queues)
     {
         var q = kv.Value;
@@ -275,14 +271,21 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
             if (!cur.EndTs.HasValue)
             {
-                cur.EndTs = cur.StartTs;
-                cur.EndIdx = cur.StartIdx;
+                cur.EndTs = cur.SuccessTs ?? cur.StartTs;
+                cur.EndIdx = cur.SuccessIdx >= 0 ? cur.SuccessIdx : cur.StartIdx;
             }
 
-            cur.Status = "NG";
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            result.Add(cur);
+            if (cur.Status == "Success")
+            {
+                result.Add(cur);
+            }
+            else
+            {
+                cur.Status = "NG";
+                result.Add(cur);
+            }
         }
     }
 
@@ -292,10 +295,10 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
 
 
-4. 헬퍼 메서드 추가
+4. 헬퍼 메서드 추가 또는 교체
 
 
-같은 클래스 내부에 추가하세요. 기존에 있으면 중복 추가하지 말고 교체하세요.
+이미 있으면 교체하세요.
 
 
 private string PickVarFromTokens(List<string> tokens)
@@ -303,7 +306,6 @@ private string PickVarFromTokens(List<string> tokens)
     if (tokens == null || tokens.Count == 0)
         return null;
 
-    // BR_ 토큰 우선
     var br = tokens.FirstOrDefault(t =>
         !string.IsNullOrWhiteSpace(t) &&
         t.Trim().StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
@@ -311,7 +313,6 @@ private string PickVarFromTokens(List<string> tokens)
     if (!string.IsNullOrWhiteSpace(br))
         return br.Trim();
 
-    // BR_이 없으면 빈값, STEP_ 제외 후 마지막 유효 토큰
     var valid = tokens
         .Select(t => (t ?? "").Trim())
         .Where(t => !string.IsNullOrWhiteSpace(t))
@@ -338,7 +339,27 @@ private string GetDeviceFromFileName(string file)
 적용 후 기대 결과
 
 
-이 흐름이면:
+정상 패턴:
+
+
+Start
+Start
+Success
+End
+Success
+End
+
+
+
+결과:
+
+
+1번째 Start ~ 1번째 End = Success
+2번째 Start ~ 2번째 End = Success
+
+
+
+문제 패턴:
 
 
 Start
@@ -350,14 +371,16 @@ End
 
 
 
-결과는 이렇게 나와야 합니다.
+결과:
 
 
-Start ~ Fail = NG
-Start ~ Fail = NG
+1번째 Start ~ 1번째 Fail = NG
+2번째 Start ~ 2번째 Fail = NG
 마지막 End = 무시
 
 
 
-End만 보고 Success로 찍히는 문제는 없어집니다.
+지금은 Other로 상세 범위를 확장하지 않는 게 안전합니다.
+
+그 부분까지 넣으면 정상 케이스에서 범위가 꼬일 가능성이 큽니다.
 
