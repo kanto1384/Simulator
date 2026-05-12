@@ -1,33 +1,9 @@
-맞습니다. 지금처럼 로그가 통합되어 있지 않으면 닫히지 않은 Start를 NG로 강제 표시하면 안 됩니다.
+아래 코드만 반영하세요.
+
+핵심은 Unknown 유지 + JSON 동적 컬럼 유지 + 기존 Start/Success/End 패턴 유지입니다. THICK_NG_SECTION처럼 Start/End/Fail이 섞이는 로그와, THICK_SCAN_AVG처럼 Start/Success/End가 반복되는 로그가 같이 있으니 End=Success로 단정하면 안 됩니다.
 
 
-현재 문제는 이겁니다.
-
-
-Start만 있고 Success/Fail이 없는 미완료 건
-→ 전부 NG로 화면에 표시됨
-→ 이상한 로그들이 한곳에 몰림
-
-
-
-그래서 기준을 바꿔야 합니다.
-
-
-Success 있음 → Success 표시
-Fail 있음    → NG 표시
-Start만 있음 → 표시하지 않음
-End만 있음   → 표시하지 않음
-
-
-
-즉, 명확하게 완료된 건만 화면에 표시해야 합니다.
-
-
-
-1. BuildMergedQueue만 다시 교체하세요
-
-
-아래 버전은 미완료 Start를 NG로 만들지 않습니다.
+1. BuildMergedQueue() 전체 교체
 
 
 private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
@@ -68,44 +44,46 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             var cur = q.Peek();
 
             cur.SuccessTs = r.Timestamp;
-            cur.SuccessIdx = (int)r.LineIndex;
+            cur.SuccessIdx = (int)r.LineIndex;   // JSON 동적 컬럼 기준
             cur.EndTs = r.Timestamp;
             cur.EndIdx = (int)r.LineIndex;
             cur.Status = "Success";
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            if (string.IsNullOrEmpty(cur.MLot) && cur.SuccessIdx >= 0)
-            {
-                if (kvIndexByFile.TryGetValue(cur.SourceFile, out var fileMap) &&
-                    fileMap.TryGetValue(cur.SuccessIdx, out var pairs))
-                {
-                    cur.MLot = PickLotFromPairs(cur.Var, pairs);
-                }
-            }
+            FillLotIfPossible(cur);
 
-            // Success만으로 바로 표시하지 않고 End까지 기다림
+            // Success만으로는 result.Add 하지 않음.
+            // 기존 정상 패턴 Start Start Success End Success End 때문에 End에서 닫음.
         }
         else if (r.Kind == ActionKind.End)
         {
             if (q.Count == 0)
                 continue;
 
-            var cur = q.Peek();
+            var cur = q.Dequeue();
 
             cur.EndTs = r.Timestamp;
             cur.EndIdx = (int)r.LineIndex;
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
-            // Success가 찍힌 건만 End에서 확정 표시
             if (cur.Status == "Success")
             {
-                q.Dequeue();
+                // SuccessIdx는 기존 Success 라인 유지
+                FillLotIfPossible(cur);
                 result.Add(cur);
             }
+            else
+            {
+                // Start + End만 있는 경우
+                // 작업 흔적은 있으므로 Unknown 표시
+                // JSON/동적 컬럼 기준으로 End 라인을 넣음
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;
+                cur.Status = "Unknown";
 
-            // Success 없는 End는 보류
-            // 뒤에 Fail이 오면 NG로 닫힘
-            // 끝까지 아무것도 없으면 표시 안 함
+                FillLotIfPossible(cur);
+                result.Add(cur);
+            }
         }
         else if (r.Kind == ActionKind.Fail)
         {
@@ -114,18 +92,19 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 var cur = q.Dequeue();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON 동적 컬럼 기준
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "NG";
                 cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
+                FillLotIfPossible(cur);
                 result.Add(cur);
             }
             else
             {
-                // Start 없이 Fail만 찍힌 경우만 단독 NG 표시
-                result.Add(new CombinedRow
+                // Start 없이 Fail만 나온 경우도 NG로 표시
+                var failRow = new CombinedRow
                 {
                     Var = r.Var,
                     StartTs = r.Timestamp,
@@ -135,101 +114,124 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                     SourceFile = r.SourceFile,
                     StartIdx = (int)r.LineIndex,
                     EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,   // JSON 동적 컬럼 기준
                     DurationSeconds = 0
-                });
+                };
+
+                FillLotIfPossible(failRow);
+                result.Add(failRow);
             }
         }
         else
         {
-            // Other는 병합 판정에 사용하지 않음
+            // Other는 판정에 사용하지 않음
+            // [BR_...] 단독 로그로 큐를 건드리면 기존 정상 패턴이 깨질 수 있음
             continue;
         }
     }
 
-    // 중요:
-    // 남은 큐를 NG로 추가하지 않음.
-    // Start만 있고 Success/Fail/End 확정이 없는 건은 화면 표시 제외.
+    // 남은 Start도 작업 흔적이므로 Unknown으로 표시
+    foreach (var kv in queues)
+    {
+        var q = kv.Value;
+
+        while (q.Count > 0)
+        {
+            var cur = q.Dequeue();
+
+            if (!cur.EndTs.HasValue)
+            {
+                cur.EndTs = cur.StartTs;
+                cur.EndIdx = cur.StartIdx;
+            }
+
+            cur.SuccessTs = cur.EndTs;
+            cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;   // JSON 동적 컬럼 기준
+            cur.Status = "Unknown";
+            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
+            FillLotIfPossible(cur);
+            result.Add(cur);
+        }
+    }
+
     return result.OrderBy(x => x.StartTs).ToList();
 }
 
 
 
-
-2. 이 버전의 처리 기준
-
-
-정상 패턴:
+2. 헬퍼 메서드 추가
 
 
-Start
-Start
-Success
-End
-Success
-End
+같은 클래스 안에 추가하세요.
 
 
+private void FillLotIfPossible(CombinedRow row)
+{
+    if (row == null)
+        return;
 
-결과:
+    if (!string.IsNullOrEmpty(row.MLot))
+        return;
 
+    if (row.SuccessIdx < 0)
+        return;
 
-1번째 Start ~ 1번째 End = Success
-2번째 Start ~ 2번째 End = Success
-
-
-
-문제 패턴:
-
-
-Start
-Fail
-Start
-End
-Fail
-End
+    if (kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) &&
+        fileMap.TryGetValue(row.SuccessIdx, out var pairs))
+    {
+        row.MLot = PickLotFromPairs(row.Var, pairs);
+    }
+}
 
 
 
-결과:
+3. GridMerged_RowPrePaint() 조건 교체
 
 
-1번째 Start ~ 1번째 Fail = NG
-2번째 Start ~ 2번째 Fail = NG
-마지막 End = 무시
+Unknown도 확인 가능하게 색상 처리합니다.
 
 
+private void GridMerged_RowPrePaint(object sender, DataGridViewRowPrePaintEventArgs e)
+{
+    if (e.RowIndex < 0 || e.RowIndex >= gridMerged.Rows.Count)
+        return;
 
-미완료 패턴:
+    if (gridMerged.Rows[e.RowIndex].IsNewRow)
+        return;
 
+    var row = gridMerged.Rows[e.RowIndex].DataBoundItem as CombinedRow;
+    if (row == null)
+        return;
 
-Start
-End
+    var th = (double)numThreshold.Value;
 
-
-
-결과:
-
-
-표시 안 함
-
-
-
-
-결론
-
-
-지금 로그 구조에서는 미완료 건을 NG로 표시하면 안 됩니다.
-
-
-NG는 아래 경우만 표시하는 게 맞습니다.
-
-
-Fail 있음
-ACK=NG 있음
-Start 없이 Fail 단독 존재
+    if ((row.DurationSeconds.HasValue && row.DurationSeconds.Value >= th) ||
+        row.Status == "NG" ||
+        row.Status == "Unknown")
+    {
+        gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 220, 220);
+    }
+    else
+    {
+        gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.White;
+    }
+}
 
 
 
-Start만 있음, End만 있음, Start + End만 있음은 통합 로그가 아니기 때문에 화면에서 제외하는 쪽이 신뢰성이 더 높습니다.
+최종 상태 기준:
+
+
+Start + Success + End  → Success
+Start + End            → Unknown
+Start만 남음           → Unknown
+Start + Fail           → NG
+Fail 단독              → NG
+Success 단독           → 무시
+End 단독               → 무시
+
+
+
+SuccessIdx는 모든 표시 행에 채워지므로 JSON 동적 컬럼도 다시 펼쳐져야 합니다.
 
