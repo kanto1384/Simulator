@@ -1,21 +1,18 @@
-맞습니다. 내가 판단해서 SuccessIdx = -1로 죽이면 안 됩니다.
-
-표시되는 모든 Row는 JSON/LOT 기준 인덱스를 반드시 가져야 합니다.
+아래 코드 기준으로 정리합니다.
 
 
-아래 코드로 가세요.
+기준은 이겁니다.
 
 
-기준:
-
-
-Success → SuccessIdx = Success 라인
-NG      → SuccessIdx = Fail 라인
-Unknown → SuccessIdx = End 라인, 없으면 Start 라인
+로그 Row 제거 안 함
+결과 Row 임의 중복 제거 안 함
+Success / Fail / End / Other / Start 단독도 가능한 한 표시
+LOT / JSON 컬럼은 표시 Row의 SuccessIdx 기준으로 조회
 
 
 
-gridMerged_CellFormatting이 SuccessIdx로 kvIndexByFile을 조회하는 구조라서, 모든 표시 Row에 SuccessIdx를 넣어야 JSON 동적 컬럼이 살아납니다. 기존 소스도 SuccessIdx를 기준으로 동적 컬럼 값을 가져오는 구조입니다. 
+네 기존 소스는 동적 컬럼/LOT을 SuccessIdx -> kvIndexByFile 기준으로 펼치는 구조라서, 표시되는 Row에는 반드시 SuccessIdx가 있어야 합니다. 
+
 
 
 1. BuildMergedQueue() 전체 교체
@@ -54,51 +51,92 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         }
         else if (r.Kind == ActionKind.Success)
         {
-            if (q.Count == 0)
-                continue;
-
-            var cur = q.Peek();
-
-            cur.SuccessTs = r.Timestamp;
-            cur.SuccessIdx = (int)r.LineIndex;   // JSON/LOT 기준
-            cur.EndTs = r.Timestamp;
-            cur.EndIdx = (int)r.LineIndex;
-            cur.Status = "Success";
-            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
-
-            FillLotByIndex(cur);
-
-            // 기존 정상 패턴:
-            // Start Start Success End Success End
-            // 때문에 Success에서 바로 Add 하지 않고 End에서 닫음
-        }
-        else if (r.Kind == ActionKind.End)
-        {
-            if (q.Count == 0)
-                continue;
-
-            var cur = q.Dequeue();
-
-            cur.EndTs = r.Timestamp;
-            cur.EndIdx = (int)r.LineIndex;
-            cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
-
-            if (cur.Status == "Success")
+            if (q.Count > 0)
             {
-                // SuccessIdx는 Success 라인 유지
+                var cur = q.Peek();
+
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.Status = "Success";
+                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
                 FillLotByIndex(cur);
-                result.Add(cur);
+
+                // 기존 정상 패턴:
+                // Start Start Success End Success End
+                // 때문에 Success에서는 닫지 않고 End를 기다림
             }
             else
             {
-                // Start + End만 있는 경우도 작업 흔적이므로 Unknown 표시
-                // JSON/LOT도 보여야 하므로 End 라인을 기준으로 넣음
-                cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;   // JSON/LOT 기준
-                cur.Status = "Unknown";
+                // Start 없이 Success만 있는 로그도 사실 그대로 표시
+                var row = new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "Success",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0,
+                    MLot = ""
+                };
 
-                FillLotByIndex(cur);
-                result.Add(cur);
+                FillLotByIndex(row);
+                result.Add(row);
+            }
+        }
+        else if (r.Kind == ActionKind.End)
+        {
+            if (q.Count > 0)
+            {
+                var cur = q.Dequeue();
+
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+
+                if (cur.Status == "Success")
+                {
+                    // SuccessIdx는 Success 라인 유지
+                    FillLotByIndex(cur);
+                    result.Add(cur);
+                }
+                else
+                {
+                    // Start + End만 있는 경우
+                    cur.Status = "Unknown";
+                    cur.SuccessTs = r.Timestamp;
+                    cur.SuccessIdx = (int)r.LineIndex; // JSON/LOT 기준: End 라인
+
+                    FillLotByIndex(cur);
+                    result.Add(cur);
+                }
+            }
+            else
+            {
+                // End 단독도 사실 그대로 표시
+                var row = new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "Unknown",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0,
+                    MLot = ""
+                };
+
+                FillLotByIndex(row);
+                result.Add(row);
             }
         }
         else if (r.Kind == ActionKind.Fail)
@@ -108,7 +146,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 var cur = q.Dequeue();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;   // JSON/LOT 기준
+                cur.SuccessIdx = (int)r.LineIndex; // JSON/LOT 기준: Fail 라인
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "NG";
@@ -119,8 +157,8 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             }
             else
             {
-                // Start 없이 Fail만 나온 경우도 NG 표시
-                var failRow = new CombinedRow
+                // Fail 단독도 표시
+                var row = new CombinedRow
                 {
                     Var = r.Var,
                     StartTs = r.Timestamp,
@@ -130,19 +168,48 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                     SourceFile = r.SourceFile,
                     StartIdx = (int)r.LineIndex,
                     EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,   // JSON/LOT 기준
+                    SuccessIdx = (int)r.LineIndex,
                     DurationSeconds = 0,
                     MLot = ""
                 };
 
-                FillLotByIndex(failRow);
-                result.Add(failRow);
+                FillLotByIndex(row);
+                result.Add(row);
             }
         }
         else
         {
-            // Other는 판정에는 사용하지 않음
-            continue;
+            // [BR_...]만 있는 로그도 표시
+            if (q.Count > 0)
+            {
+                var cur = q.Peek();
+
+                // 열린 Start의 상세 범위만 확장
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+            }
+            else
+            {
+                // 단독 BR 로그도 Unknown으로 표시
+                var row = new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "Unknown",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0,
+                    MLot = ""
+                };
+
+                FillLotByIndex(row);
+                result.Add(row);
+            }
         }
     }
 
@@ -162,8 +229,8 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
             }
 
             cur.SuccessTs = cur.EndTs;
-            cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;   // JSON/LOT 기준
-            cur.Status = "Unknown";
+            cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
+            cur.Status = cur.Status == "Success" ? "Success" : "Unknown";
             cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
 
             FillLotByIndex(cur);
@@ -171,15 +238,15 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         }
     }
 
-    return result.OrderBy(x => x.StartTs).ToList();
+    // 중복 제거 금지
+    // 실제 로그 순서 그대로 보기 위해 StartTs + StartIdx 기준 정렬만 함
+    return result.OrderBy(x => x.StartTs).ThenBy(x => x.StartIdx).ToList();
 }
 
 
 
-2. 헬퍼 메서드 추가
 
-
-같은 클래스 안에 추가하세요.
+2. FillLotByIndex() 추가
 
 
 private void FillLotByIndex(CombinedRow row)
@@ -202,51 +269,206 @@ private void FillLotByIndex(CombinedRow row)
 
 
 
-3. 기존에 넣었던 것 제거
+
+3. 중요: BuildKVIndexForFile()도 모든 BR 라인을 인덱싱해야 함
 
 
-아래 함수/호출을 넣어놨으면 제거하세요.
+LOT/JSON이 안 뜨는 원인이 여기일 가능성이 큽니다. 기존이 Success 블록만 인덱싱하면 Fail, End, Unknown, [BR_] 단독 기준의 SuccessIdx는 못 찾습니다.
 
 
-PickLotFromRange(...)
-FillLotIfPossible(...)
+BuildKVIndexForFile()을 아래로 교체하세요.
 
 
-
-그리고 이런 식으로 SuccessIdx = -1을 넣는 코드도 제거하세요.
-
-
-cur.SuccessIdx = -1;
-
-
-
-4. Unknown 색상 표시
-
-
-GridMerged_RowPrePaint()는 이 조건으로 두세요.
-
-
-if ((row.DurationSeconds.HasValue && row.DurationSeconds.Value >= th) ||
-    row.Status == "NG" ||
-    row.Status == "Unknown")
+private void BuildKVIndexForFile(string file)
 {
-    gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 220, 220);
+    string source = Path.GetFileName(file);
+
+    if (!kvIndexByFile.ContainsKey(source))
+        kvIndexByFile[source] = new Dictionary<int, Dictionary<string, Dictionary<int, string>>>();
+
+    if (!lotIndexByFile.ContainsKey(source))
+        lotIndexByFile[source] = new Dictionary<int, string>();
+
+    var fileMap = kvIndexByFile[source];
+    var lotMap = lotIndexByFile[source];
+
+    string[] lines = File.ReadAllLines(file, Encoding.UTF8);
+
+    for (int i = 0; i < lines.Length; i++)
+    {
+        string line = lines[i];
+
+        var hm = headRx.Match(line);
+        if (!hm.Success)
+            continue;
+
+        string rest = hm.Groups["rest"].Value;
+        string varName = GetVarFromHeader(source, rest);
+
+        if (string.IsNullOrWhiteSpace(varName) ||
+            !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+        {
+            continue;
+        }
+
+        var blockLines = new List<string>();
+
+        for (int j = i; j < lines.Length; j++)
+        {
+            if (j > i && headRx.IsMatch(lines[j]))
+                break;
+
+            blockLines.Add(lines[j]);
+        }
+
+        var pairs = ExtractKeyValuePairsFromBlock(blockLines);
+
+        // 데이터가 없어도 넣어둠
+        // 그래야 SuccessIdx가 Fail/End/Other여도 조회 자체는 가능
+        fileMap[i] = pairs;
+
+        string lot = PickLotFromPairs(varName, pairs);
+        if (!string.IsNullOrWhiteSpace(lot))
+            lotMap[i] = lot;
+    }
 }
-else
+
+
+
+
+4. ExtractKeyValuePairsFromBlock() 추가
+
+
+private Dictionary<string, Dictionary<int, string>> ExtractKeyValuePairsFromBlock(List<string> blockLines)
 {
-    gridMerged.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.White;
+    var result = new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
+
+    if (blockLines == null || blockLines.Count == 0)
+        return result;
+
+    var rx = new Regex(
+        @"^\s*\[\s*(?<idx>\d+)\s*:\s*(?<key>[^\]]+)\]\s*[:=]\s*(?<val>.*)$",
+        RegexOptions.IgnoreCase);
+
+    foreach (var line in blockLines)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            continue;
+
+        var m = rx.Match(line);
+        if (!m.Success)
+            continue;
+
+        int idx;
+        if (!int.TryParse(m.Groups["idx"].Value.Trim(), out idx))
+            idx = 0;
+
+        string key = (m.Groups["key"].Value ?? "").Trim();
+        string val = (m.Groups["val"].Value ?? "").Trim();
+
+        if (string.IsNullOrWhiteSpace(key))
+            continue;
+
+        if (!result.TryGetValue(key, out var byIndex))
+        {
+            byIndex = new Dictionary<int, string>();
+            result[key] = byIndex;
+        }
+
+        byIndex[idx] = val;
+    }
+
+    return result;
 }
 
 
 
-이제 표시되는 행은 전부 SuccessIdx가 들어갑니다.
+
+5. PickLotFromPairs() 교체
 
 
-Success → Success 라인 기준으로 JSON/LOT 표시
-NG      → Fail 라인 기준으로 JSON/LOT 표시
-Unknown → End 라인 또는 Start 라인 기준으로 JSON/LOT 표시
+private string PickLotFromPairs(string varName, Dictionary<string, Dictionary<int, string>> pairs)
+{
+    if (pairs == null || pairs.Count == 0)
+        return string.Empty;
+
+    var keys = new List<string>();
+
+    if (!string.IsNullOrWhiteSpace(varName) &&
+        lotKeyRules != null &&
+        lotKeyRules.TryGetValue(varName, out var ruleKeys) &&
+        ruleKeys != null)
+    {
+        keys.AddRange(ruleKeys);
+    }
+
+    if (defaultLotKeys != null)
+        keys.AddRange(defaultLotKeys);
+
+    keys.AddRange(new[]
+    {
+        "OUT_LOTID",
+        "INPUT_LOTID",
+        "INPUT_CSTID",
+        "PROD_LOTID",
+        "LOTID",
+        "LOT_ID",
+        "CSTID"
+    });
+
+    foreach (var key in keys.Where(k => !string.IsNullOrWhiteSpace(k)).Distinct(StringComparer.OrdinalIgnoreCase))
+    {
+        if (!pairs.TryGetValue(key, out var byIndex))
+            continue;
+
+        var value = byIndex
+            .OrderBy(x => x.Key)
+            .Select(x => x.Value)
+            .FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+
+        if (!string.IsNullOrWhiteSpace(value))
+            return value.Trim();
+    }
+
+    return string.Empty;
+}
 
 
 
-즉, “데이터가 있으면 다 뜨게” 하는 방식입니다.
+
+6. 제거할 것
+
+
+아래는 넣지 마세요.
+
+
+DedupKeepLastRow(...)
+
+
+
+그리고 마지막 return도 반드시 이 형태입니다.
+
+
+return result.OrderBy(x => x.StartTs).ThenBy(x => x.StartIdx).ToList();
+
+
+
+SuccessIdx = -1로 강제로 죽이는 코드도 표시 Row에서는 쓰지 마세요.
+
+
+결과 기준:
+
+
+Start + Success + End  → Success
+Start + Fail           → NG
+Start + End            → Unknown
+Start만 남음           → Unknown
+Fail 단독              → NG
+Success 단독           → Success
+End 단독               → Unknown
+[BR_] 단독             → Unknown
+
+
+
+이제 Row를 임의로 제거하지 않고, LOT/JSON도 해당 라인 기준으로 조회합니다.
 
