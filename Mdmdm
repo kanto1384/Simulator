@@ -1,88 +1,39 @@
-var tokens = new List<string>();
-string tmp = rest;
-
-var bracketRx = new Regex(@"^\s*\[(?<tok>[^\]]*)\]");
-
-int guard = 0;
-while (guard < 10)
-{
-    var bm = bracketRx.Match(tmp);
-    if (!bm.Success) break;
-
-    tokens.Add(bm.Groups["tok"].Value.Trim());
-
-    tmp = tmp.Substring(bm.Length).TrimStart();
-
-    guard++;
-}
-
-// 로그 레벨 제거
-if (tokens.Count > 0 &&
-    IsLogLevel(tokens[0]))
-{
-    tokens.RemoveAt(0);
-}
-
-string device = null;
-string step = null;
-string varName = null;
-
-foreach (var token in tokens)
-{
-    if (string.IsNullOrWhiteSpace(token))
-        continue;
-
-    if (token.StartsWith("STEP_", StringComparison.OrdinalIgnoreCase))
-    {
-        step = token;
-        continue;
-    }
-
-    if (token.StartsWith("BR", StringComparison.OrdinalIgnoreCase))
-    {
-        varName = token;
-        continue;
-    }
-
-    if (device == null)
-    {
-        device = token;
-    }
-}
-
-if (string.IsNullOrEmpty(device))
-{
-    var n = Path.GetFileNameWithoutExtension(file);
-    var cut = n.LastIndexOf('_');
-    device = cut > 0 ? n.Substring(0, cut) : n;
-}
-
-if (string.IsNullOrEmpty(varName))
-{
-    varName = device ?? "GLOBAL";
-}
-
 var kind = DetectKind(tmp);
 
-string reason = null;
-
-if (kind == "Fail")
+if (kind == ActionKind.Other)
 {
-    int dashIndex = tmp.IndexOf('-');
-    if (dashIndex >= 0)
-        reason = tmp.Substring(dashIndex + 1).Trim();
+    kind = DetectKind(rest);
 }
 
-
-private bool IsLogLevel(string token)
+private ActionKind DetectKind(string text)
 {
-    if (string.IsNullOrWhiteSpace(token))
-        return false;
+    if (string.IsNullOrWhiteSpace(text))
+        return ActionKind.Other;
 
-    return token.Equals("info", StringComparison.OrdinalIgnoreCase)
-        || token.Equals("warn", StringComparison.OrdinalIgnoreCase)
-        || token.Equals("warning", StringComparison.OrdinalIgnoreCase)
-        || token.Equals("error", StringComparison.OrdinalIgnoreCase)
-        || token.Equals("debug", StringComparison.OrdinalIgnoreCase)
-        || token.Equals("trace", StringComparison.OrdinalIgnoreCase);
+    text = text.Trim();
+
+    // Fail은 어디에 있어도 잡아야 함
+    if (Regex.IsMatch(text, @"\bFail\b", RegexOptions.IgnoreCase))
+        return ActionKind.Fail;
+
+    if (Regex.IsMatch(text, @"ACK\s*=\s*NG", RegexOptions.IgnoreCase))
+        return ActionKind.Fail;
+
+    if (Regex.IsMatch(text, @"BizRule\s+Exception", RegexOptions.IgnoreCase))
+        return ActionKind.Fail;
+
+    if (Regex.IsMatch(text, @"\bException\b", RegexOptions.IgnoreCase))
+        return ActionKind.Fail;
+
+    // Success / End / Start는 오탐 방지를 위해 앞쪽 기준
+    if (text.StartsWith("Success", StringComparison.OrdinalIgnoreCase))
+        return ActionKind.Success;
+
+    if (text.StartsWith("End", StringComparison.OrdinalIgnoreCase))
+        return ActionKind.End;
+
+    if (text.StartsWith("Start", StringComparison.OrdinalIgnoreCase))
+        return ActionKind.Start;
+
+    return ActionKind.Other;
 }
