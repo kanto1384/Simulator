@@ -1,30 +1,48 @@
-아래 기준으로 다시 잡습니다.
+아래 버전은 이 대화 이후 정리된 최종 기준으로 다시 만든 BuildMergedQueue()입니다.
 
 
-Start → 큐에 추가
-Success → 큐 맨 앞 건을 Success 상태로 표시만 함
-End → 큐 맨 앞 건을 종료
-Start가 새로 들어왔는데 이전 큐 맨 앞이 Success 상태면 → 이전 건을 Success로 종료
-Fail → 큐 맨 앞 건을 NG로 종료
-NG는 Fail이 있을 때만 부여
+기준:
+
+
+Start → Success → Start  = 이전 건 Success 종료 후 새 Start 시작
+Start → Success → End    = Success
+Start → End              = Unknown
+Start → Fail             = NG
+Start → Fail → End       = NG 1건, 뒤 End는 무시
+Fail 단독                = NG
+Success 단독             = Success
+End 단독                 = Unknown
+NG는 Fail일 때만 부여
+Success는 End가 없어도 사라지면 안 됨
 
 
 
-즉, Start + Success 후 End가 안 오고 다음 Start가 오면 이전 건은 Success로 닫습니다.
+아래 코드만 반영하세요.
+
+BuildKVIndexForFile, PickLotFromPairs, UpdateDynamicColumnsForSearch, gridMerged_CellFormatting은 건드리지 마세요.
 
 
-BuildMergedQueue() 전체 교체
+
+1. BuildMergedQueue() 전체 교체
 
 
 private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 {
     var result = new List<CombinedRow>();
+
+    // BR별 FIFO Queue
     var queues = new Dictionary<string, Queue<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
+
+    // Fail로 이미 닫힌 직후 들어오는 End는 후속 End로 판단해서 무시하기 위함
+    var ignoreNextEndAfterFail = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     foreach (var r in ordered)
     {
-        if (string.IsNullOrEmpty(r.Var) || !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrEmpty(r.Var) ||
+            !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+        {
             continue;
+        }
 
         Queue<CombinedRow> q;
         if (!queues.TryGetValue(r.Var, out q))
@@ -35,9 +53,12 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
         if (r.Kind == ActionKind.Start)
         {
-            // 핵심:
-            // 이전 건이 Success까지 찍혔는데 End가 안 왔다면,
-            // 새 Start 시점에서 이전 건을 Success로 확정 종료한다.
+            // 새 Start가 들어왔으므로, Fail 후속 End 무시 플래그는 해제
+            ignoreNextEndAfterFail.Remove(r.Var);
+
+            // Start → Success → Start
+            // 이전 건이 Success까지 찍혔는데 End가 안 들어온 경우,
+            // 다음 Start 시점에서 이전 건을 Success로 확정 종료.
             while (q.Count > 0 && q.Peek().Status == "Success")
             {
                 var done = q.Dequeue();
@@ -49,10 +70,33 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 }
 
                 done.Status = "Success";
-                done.DurationSeconds = Math.Max(0, Math.Round((done.EndTs.Value - done.StartTs).TotalSeconds, 3));
+                done.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((done.EndTs.Value - done.StartTs).TotalSeconds, 3)
+                );
 
                 FillLotByIndex(done);
                 result.Add(done);
+            }
+
+            // Start → End → Start
+            // 이전 건이 End까지만 있고 Success/Fail이 없으면 Unknown으로 확정.
+            while (q.Count > 0 &&
+                   q.Peek().Status == "Unknown" &&
+                   q.Peek().EndTs.HasValue)
+            {
+                var unknown = q.Dequeue();
+
+                unknown.SuccessTs = unknown.EndTs;
+                unknown.SuccessIdx = unknown.EndIdx >= 0 ? unknown.EndIdx : unknown.StartIdx;
+                unknown.Status = "Unknown";
+                unknown.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((unknown.EndTs.Value - unknown.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(unknown);
+                result.Add(unknown);
             }
 
             q.Enqueue(new CombinedRow
@@ -69,27 +113,32 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         }
         else if (r.Kind == ActionKind.Success)
         {
+            ignoreNextEndAfterFail.Remove(r.Var);
+
             if (q.Count > 0)
             {
                 // FIFO 기준: 가장 먼저 열린 Start에 Success 매칭
                 var cur = q.Peek();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "Success";
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
 
                 FillLotByIndex(cur);
 
-                // 여기서 바로 result.Add 하지 않음.
-                // End가 오면 End에서 닫고,
-                // End가 안 오고 다음 Start가 오면 Start에서 Success로 닫음.
+                // 여기서 result.Add 하지 않음.
+                // End가 오면 End에서 종료.
+                // End가 안 오고 다음 Start가 오면 Start에서 Success로 종료.
             }
             else
             {
-                // Start 없이 Success만 있는 경우도 실제 로그이므로 표시
+                // Success 단독
                 var row = new CombinedRow
                 {
                     Var = r.Var,
@@ -113,32 +162,42 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         {
             if (q.Count > 0)
             {
-                var cur = q.Dequeue();
+                var cur = q.Peek();
 
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
 
                 if (cur.Status == "Success")
                 {
-                    // SuccessIdx는 Success 라인 유지
+                    // Start → Success → End
+                    q.Dequeue();
+
+                    // SuccessIdx는 Success 라인 그대로 유지
                     FillLotByIndex(cur);
                     result.Add(cur);
                 }
                 else
                 {
-                    // Start + End만 있는 경우
-                    // 성공/실패 판단 불가 → Unknown
-                    cur.Status = "Unknown";
-                    cur.SuccessTs = r.Timestamp;
-                    cur.SuccessIdx = (int)r.LineIndex; // JSON/LOT 기준은 End 라인
-
-                    FillLotByIndex(cur);
-                    result.Add(cur);
+                    // Start → End
+                    // 여기서 바로 Unknown 확정하지 않음.
+                    // 뒤에 Fail이 올 수 있으므로 큐에 남겨둠.
+                    // 다음 Start 또는 파일 끝에서 Unknown 확정.
                 }
             }
             else
             {
+                if (ignoreNextEndAfterFail.Contains(r.Var))
+                {
+                    // Start → Fail → End
+                    // Fail에서 이미 NG로 닫힌 뒤 들어온 End이므로 무시.
+                    ignoreNextEndAfterFail.Remove(r.Var);
+                    continue;
+                }
+
                 // End 단독
                 var row = new CombinedRow
                 {
@@ -163,18 +222,25 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         {
             if (q.Count > 0)
             {
-                // Fail이 있을 때만 NG
+                // Start → Fail
+                // NG는 Fail이 있을 때만 부여.
                 var cur = q.Dequeue();
 
                 cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
                 cur.Status = "NG";
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
 
                 FillLotByIndex(cur);
                 result.Add(cur);
+
+                // 바로 뒤에 같은 BR End가 오면 후속 End로 보고 무시
+                ignoreNextEndAfterFail.Add(r.Var);
             }
             else
             {
@@ -196,23 +262,29 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
                 FillLotByIndex(row);
                 result.Add(row);
+
+                // Fail 단독 뒤 End가 따라오는 경우도 후속 End로 보고 무시
+                ignoreNextEndAfterFail.Add(r.Var);
             }
         }
         else
         {
-            // [BR_...] 단독 로그
+            // [BR_...] 단독 또는 STEP 로그 등
+            // 판정은 하지 않고, 열린 큐가 있으면 상세 범위만 확장.
             if (q.Count > 0)
             {
-                // 열린 Start의 상세 범위만 확장
                 var cur = q.Peek();
 
                 cur.EndTs = r.Timestamp;
                 cur.EndIdx = (int)r.LineIndex;
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
             }
             else
             {
-                // 단독 BR 로그도 표시
+                // 단독 BR 로그는 Unknown으로 표시
                 var row = new CombinedRow
                 {
                     Var = r.Var,
@@ -245,7 +317,7 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 
             if (cur.Status == "Success")
             {
-                // Start + Success까지만 있고 End가 없어도 Success 유지
+                // Start → Success 까지만 있고 End가 없어도 Success 유지
                 if (!cur.EndTs.HasValue)
                 {
                     cur.EndTs = cur.SuccessTs ?? cur.StartTs;
@@ -253,7 +325,10 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 }
 
                 cur.Status = "Success";
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
 
                 FillLotByIndex(cur);
                 result.Add(cur);
@@ -270,7 +345,10 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
                 cur.SuccessTs = cur.EndTs;
                 cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
                 cur.Status = "Unknown";
-                cur.DurationSeconds = Math.Max(0, Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3));
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
 
                 FillLotByIndex(cur);
                 result.Add(cur);
@@ -278,12 +356,19 @@ private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
         }
     }
 
-    return result.OrderBy(x => x.StartTs).ThenBy(x => x.StartIdx).ToList();
+    return result
+        .OrderBy(x => x.StartTs)
+        .ThenBy(x => x.StartIdx)
+        .ToList();
 }
 
 
 
-FillLotByIndex() 없으면 추가
+
+2. FillLotByIndex() 없으면 추가
+
+
+이미 있으면 중복 추가하지 마세요.
 
 
 private void FillLotByIndex(CombinedRow row)
@@ -306,40 +391,21 @@ private void FillLotByIndex(CombinedRow row)
 
 
 
-처리 결과 기준
+
+이 버전에서 가장 중요한 부분은 이것입니다.
 
 
 Start → Success → Start
-= 첫 번째 건 Success로 종료 후 새 Start 시작
+= 이전 Success 큐를 Success로 종료
 
-Start → Success → End
-= Success
+Start → Fail → End
+= Fail에서 NG 종료, 뒤 End는 무시
 
 Start → End
-= Unknown
-
-Start → Fail
-= NG
-
-Fail 단독
-= NG
-
-Success 단독
-= Success
-
-End 단독
-= Unknown
+= 바로 확정하지 않고 보류
+= 다음 Start 또는 파일 끝에서 Unknown
 
 
 
-중요한 점은 이겁니다.
-
-
-NG는 Fail이 있을 때만 부여
-Start + Success는 End가 없어도 Success 유지
-Start + Success 후 다음 Start가 오면 이전 건은 Success로 종료
-
-
-
-BuildKVIndexForFile, PickLotFromPairs, UpdateDynamicColumnsForSearch, gridMerged_CellFormatting은 그대로 두세요.
+이제 Success는 End가 없어도 사라지지 않고, NG는 Fail이 있을 때만 찍힙니다.
 
