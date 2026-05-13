@@ -1,411 +1,117 @@
-아래 버전은 이 대화 이후 정리된 최종 기준으로 다시 만든 BuildMergedQueue()입니다.
+아래처럼 BuildKVIndexForFile() 메서드 전체 교체하세요.
+
+핵심은 File.ReadAllLines() 제거하고 FileShare.ReadWrite | FileShare.Delete로 여는 겁니다.
 
 
-기준:
-
-
-Start → Success → Start  = 이전 건 Success 종료 후 새 Start 시작
-Start → Success → End    = Success
-Start → End              = Unknown
-Start → Fail             = NG
-Start → Fail → End       = NG 1건, 뒤 End는 무시
-Fail 단독                = NG
-Success 단독             = Success
-End 단독                 = Unknown
-NG는 Fail일 때만 부여
-Success는 End가 없어도 사라지면 안 됨
-
-
-
-아래 코드만 반영하세요.
-
-BuildKVIndexForFile, PickLotFromPairs, UpdateDynamicColumnsForSearch, gridMerged_CellFormatting은 건드리지 마세요.
-
-
-
-1. BuildMergedQueue() 전체 교체
-
-
-private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
+private void BuildKVIndexForFile(string file)
 {
-    var result = new List<CombinedRow>();
+    string source = Path.GetFileName(file);
 
-    // BR별 FIFO Queue
-    var queues = new Dictionary<string, Queue<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
+    if (!kvIndexByFile.ContainsKey(source))
+        kvIndexByFile[source] = new Dictionary<int, Dictionary<string, Dictionary<int, string>>>();
 
-    // Fail로 이미 닫힌 직후 들어오는 End는 후속 End로 판단해서 무시하기 위함
-    var ignoreNextEndAfterFail = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (!lotIndexByFile.ContainsKey(source))
+        lotIndexByFile[source] = new Dictionary<int, string>();
 
-    foreach (var r in ordered)
+    var fileMap = kvIndexByFile[source];
+    var lotMap = lotIndexByFile[source];
+
+    string[] lines;
+
+    // 운영 로그 파일이 다른 프로세스에서 쓰는 중이어도 읽을 수 있게 처리
+    using (var fs = new FileStream(
+        file,
+        FileMode.Open,
+        FileAccess.Read,
+        FileShare.ReadWrite | FileShare.Delete))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true))
     {
-        if (string.IsNullOrEmpty(r.Var) ||
-            !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+        var list = new List<string>();
+
+        string line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            list.Add(line);
+        }
+
+        lines = list.ToArray();
+    }
+
+    for (int i = 0; i < lines.Length; i++)
+    {
+        string line = lines[i];
+
+        var hm = headRx.Match(line);
+        if (!hm.Success)
+            continue;
+
+        string rest = hm.Groups["rest"].Value;
+
+        string varName = GetVarFromHeader(source, rest);
+
+        if (string.IsNullOrWhiteSpace(varName) ||
+            !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
         {
             continue;
         }
 
-        Queue<CombinedRow> q;
-        if (!queues.TryGetValue(r.Var, out q))
-        {
-            q = new Queue<CombinedRow>();
-            queues[r.Var] = q;
-        }
+        var pairs = new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
 
-        if (r.Kind == ActionKind.Start)
-        {
-            // 새 Start가 들어왔으므로, Fail 후속 End 무시 플래그는 해제
-            ignoreNextEndAfterFail.Remove(r.Var);
+        int j = i + 1;
 
-            // Start → Success → Start
-            // 이전 건이 Success까지 찍혔는데 End가 안 들어온 경우,
-            // 다음 Start 시점에서 이전 건을 Success로 확정 종료.
-            while (q.Count > 0 && q.Peek().Status == "Success")
+        while (j < lines.Length)
+        {
+            string bodyLine = lines[j];
+
+            // 다음 로그 헤더가 나오면 현재 블록 종료
+            if (headRx.IsMatch(bodyLine))
+                break;
+
+            var kv = Regex.Match(
+                bodyLine,
+                @"^\s*\[(?<idx>\d+)\s*:\s*(?<key>[^\]]+)\]\s*:\s*(?<val>.*)$",
+                RegexOptions.IgnoreCase);
+
+            if (kv.Success)
             {
-                var done = q.Dequeue();
+                int idx;
+                if (!int.TryParse(kv.Groups["idx"].Value, out idx))
+                    idx = 0;
 
-                if (!done.EndTs.HasValue)
+                string key = kv.Groups["key"].Value.Trim();
+                string val = kv.Groups["val"].Value.Trim();
+
+                if (!pairs.TryGetValue(key, out var byIndex))
                 {
-                    done.EndTs = done.SuccessTs ?? done.StartTs;
-                    done.EndIdx = done.SuccessIdx >= 0 ? done.SuccessIdx : done.StartIdx;
+                    byIndex = new Dictionary<int, string>();
+                    pairs[key] = byIndex;
                 }
 
-                done.Status = "Success";
-                done.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((done.EndTs.Value - done.StartTs).TotalSeconds, 3)
-                );
-
-                FillLotByIndex(done);
-                result.Add(done);
+                byIndex[idx] = val;
             }
 
-            // Start → End → Start
-            // 이전 건이 End까지만 있고 Success/Fail이 없으면 Unknown으로 확정.
-            while (q.Count > 0 &&
-                   q.Peek().Status == "Unknown" &&
-                   q.Peek().EndTs.HasValue)
-            {
-                var unknown = q.Dequeue();
-
-                unknown.SuccessTs = unknown.EndTs;
-                unknown.SuccessIdx = unknown.EndIdx >= 0 ? unknown.EndIdx : unknown.StartIdx;
-                unknown.Status = "Unknown";
-                unknown.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((unknown.EndTs.Value - unknown.StartTs).TotalSeconds, 3)
-                );
-
-                FillLotByIndex(unknown);
-                result.Add(unknown);
-            }
-
-            q.Enqueue(new CombinedRow
-            {
-                Var = r.Var,
-                StartTs = r.Timestamp,
-                Status = "Unknown",
-                SourceFile = r.SourceFile,
-                StartIdx = (int)r.LineIndex,
-                EndIdx = -1,
-                SuccessIdx = -1,
-                MLot = ""
-            });
+            j++;
         }
-        else if (r.Kind == ActionKind.Success)
+
+        if (pairs.Count > 0)
         {
-            ignoreNextEndAfterFail.Remove(r.Var);
+            fileMap[i] = pairs;
 
-            if (q.Count > 0)
-            {
-                // FIFO 기준: 가장 먼저 열린 Start에 Success 매칭
-                var cur = q.Peek();
-
-                cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
-                cur.EndTs = r.Timestamp;
-                cur.EndIdx = (int)r.LineIndex;
-                cur.Status = "Success";
-                cur.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
-                );
-
-                FillLotByIndex(cur);
-
-                // 여기서 result.Add 하지 않음.
-                // End가 오면 End에서 종료.
-                // End가 안 오고 다음 Start가 오면 Start에서 Success로 종료.
-            }
-            else
-            {
-                // Success 단독
-                var row = new CombinedRow
-                {
-                    Var = r.Var,
-                    StartTs = r.Timestamp,
-                    SuccessTs = r.Timestamp,
-                    EndTs = r.Timestamp,
-                    Status = "Success",
-                    SourceFile = r.SourceFile,
-                    StartIdx = (int)r.LineIndex,
-                    EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,
-                    DurationSeconds = 0,
-                    MLot = ""
-                };
-
-                FillLotByIndex(row);
-                result.Add(row);
-            }
+            string lot = PickLotFromPairs(varName, pairs);
+            if (!string.IsNullOrWhiteSpace(lot))
+                lotMap[i] = lot;
         }
-        else if (r.Kind == ActionKind.End)
-        {
-            if (q.Count > 0)
-            {
-                var cur = q.Peek();
-
-                cur.EndTs = r.Timestamp;
-                cur.EndIdx = (int)r.LineIndex;
-                cur.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
-                );
-
-                if (cur.Status == "Success")
-                {
-                    // Start → Success → End
-                    q.Dequeue();
-
-                    // SuccessIdx는 Success 라인 그대로 유지
-                    FillLotByIndex(cur);
-                    result.Add(cur);
-                }
-                else
-                {
-                    // Start → End
-                    // 여기서 바로 Unknown 확정하지 않음.
-                    // 뒤에 Fail이 올 수 있으므로 큐에 남겨둠.
-                    // 다음 Start 또는 파일 끝에서 Unknown 확정.
-                }
-            }
-            else
-            {
-                if (ignoreNextEndAfterFail.Contains(r.Var))
-                {
-                    // Start → Fail → End
-                    // Fail에서 이미 NG로 닫힌 뒤 들어온 End이므로 무시.
-                    ignoreNextEndAfterFail.Remove(r.Var);
-                    continue;
-                }
-
-                // End 단독
-                var row = new CombinedRow
-                {
-                    Var = r.Var,
-                    StartTs = r.Timestamp,
-                    SuccessTs = r.Timestamp,
-                    EndTs = r.Timestamp,
-                    Status = "Unknown",
-                    SourceFile = r.SourceFile,
-                    StartIdx = (int)r.LineIndex,
-                    EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,
-                    DurationSeconds = 0,
-                    MLot = ""
-                };
-
-                FillLotByIndex(row);
-                result.Add(row);
-            }
-        }
-        else if (r.Kind == ActionKind.Fail)
-        {
-            if (q.Count > 0)
-            {
-                // Start → Fail
-                // NG는 Fail이 있을 때만 부여.
-                var cur = q.Dequeue();
-
-                cur.SuccessTs = r.Timestamp;
-                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
-                cur.EndTs = r.Timestamp;
-                cur.EndIdx = (int)r.LineIndex;
-                cur.Status = "NG";
-                cur.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
-                );
-
-                FillLotByIndex(cur);
-                result.Add(cur);
-
-                // 바로 뒤에 같은 BR End가 오면 후속 End로 보고 무시
-                ignoreNextEndAfterFail.Add(r.Var);
-            }
-            else
-            {
-                // Fail 단독
-                var row = new CombinedRow
-                {
-                    Var = r.Var,
-                    StartTs = r.Timestamp,
-                    SuccessTs = r.Timestamp,
-                    EndTs = r.Timestamp,
-                    Status = "NG",
-                    SourceFile = r.SourceFile,
-                    StartIdx = (int)r.LineIndex,
-                    EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,
-                    DurationSeconds = 0,
-                    MLot = ""
-                };
-
-                FillLotByIndex(row);
-                result.Add(row);
-
-                // Fail 단독 뒤 End가 따라오는 경우도 후속 End로 보고 무시
-                ignoreNextEndAfterFail.Add(r.Var);
-            }
-        }
-        else
-        {
-            // [BR_...] 단독 또는 STEP 로그 등
-            // 판정은 하지 않고, 열린 큐가 있으면 상세 범위만 확장.
-            if (q.Count > 0)
-            {
-                var cur = q.Peek();
-
-                cur.EndTs = r.Timestamp;
-                cur.EndIdx = (int)r.LineIndex;
-                cur.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
-                );
-            }
-            else
-            {
-                // 단독 BR 로그는 Unknown으로 표시
-                var row = new CombinedRow
-                {
-                    Var = r.Var,
-                    StartTs = r.Timestamp,
-                    SuccessTs = r.Timestamp,
-                    EndTs = r.Timestamp,
-                    Status = "Unknown",
-                    SourceFile = r.SourceFile,
-                    StartIdx = (int)r.LineIndex,
-                    EndIdx = (int)r.LineIndex,
-                    SuccessIdx = (int)r.LineIndex,
-                    DurationSeconds = 0,
-                    MLot = ""
-                };
-
-                FillLotByIndex(row);
-                result.Add(row);
-            }
-        }
-    }
-
-    // 파일 끝까지 남은 큐 처리
-    foreach (var kv in queues)
-    {
-        var q = kv.Value;
-
-        while (q.Count > 0)
-        {
-            var cur = q.Dequeue();
-
-            if (cur.Status == "Success")
-            {
-                // Start → Success 까지만 있고 End가 없어도 Success 유지
-                if (!cur.EndTs.HasValue)
-                {
-                    cur.EndTs = cur.SuccessTs ?? cur.StartTs;
-                    cur.EndIdx = cur.SuccessIdx >= 0 ? cur.SuccessIdx : cur.StartIdx;
-                }
-
-                cur.Status = "Success";
-                cur.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
-                );
-
-                FillLotByIndex(cur);
-                result.Add(cur);
-            }
-            else
-            {
-                // Success도 Fail도 없는 Start 잔여 건은 Unknown
-                if (!cur.EndTs.HasValue)
-                {
-                    cur.EndTs = cur.StartTs;
-                    cur.EndIdx = cur.StartIdx;
-                }
-
-                cur.SuccessTs = cur.EndTs;
-                cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
-                cur.Status = "Unknown";
-                cur.DurationSeconds = Math.Max(
-                    0,
-                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
-                );
-
-                FillLotByIndex(cur);
-                result.Add(cur);
-            }
-        }
-    }
-
-    return result
-        .OrderBy(x => x.StartTs)
-        .ThenBy(x => x.StartIdx)
-        .ToList();
-}
-
-
-
-
-2. FillLotByIndex() 없으면 추가
-
-
-이미 있으면 중복 추가하지 마세요.
-
-
-private void FillLotByIndex(CombinedRow row)
-{
-    if (row == null)
-        return;
-
-    if (!string.IsNullOrEmpty(row.MLot))
-        return;
-
-    if (row.SuccessIdx < 0)
-        return;
-
-    if (kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) &&
-        fileMap.TryGetValue(row.SuccessIdx, out var pairs))
-    {
-        row.MLot = PickLotFromPairs(row.Var, pairs);
     }
 }
 
 
 
+이 메서드로 바꾸면 해당 에러는 잡힙니다.
 
-이 버전에서 가장 중요한 부분은 이것입니다.
 
-
-Start → Success → Start
-= 이전 Success 큐를 Success로 종료
-
-Start → Fail → End
-= Fail에서 NG 종료, 뒤 End는 무시
-
-Start → End
-= 바로 확정하지 않고 보류
-= 다음 Start 또는 파일 끝에서 Unknown
+The process cannot access the file because it is being used by another process.
 
 
 
-이제 Success는 End가 없어도 사라지지 않고, NG는 Fail이 있을 때만 찍힙니다.
+원인은 File.ReadAllLines()가 아니라, 운영 로그 파일을 다른 프로세스가 쓰는 중인데 공유 옵션 없이 읽으려고 해서 발생한 겁니다.
 
