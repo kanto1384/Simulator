@@ -1,117 +1,675 @@
-아래처럼 BuildKVIndexForFile() 메서드 전체 교체하세요.
-
-핵심은 File.ReadAllLines() 제거하고 FileShare.ReadWrite | FileShare.Delete로 여는 겁니다.
+아래는 지금까지 정리한 기준으로 다시 만든 최소 수정 세트입니다.
 
 
-private void BuildKVIndexForFile(string file)
+절대 건드리지 말 것:
+
+
+BuildKVIndexForFile
+PickLotFromPairs
+UpdateDynamicColumnsForSearch
+gridMerged_CellFormatting
+
+
+
+JSON / LOT 기능은 기존 구조 그대로 두고, 아래 메서드/헬퍼만 교체 또는 추가하세요.
+
+
+
+1. LogRow 클래스에 속성 추가
+
+
+LogRow 클래스 안에 아래 2개 추가하세요.
+
+
+public string Step { get; set; }
+public int StepNo { get; set; } = -1;
+
+
+
+
+2. bracketRx 확인
+
+
+이 상태여야 합니다.
+
+
+readonly Regex bracketRx = new Regex(@"^\s*\[(?<tok>[^\]]*)\]", RegexOptions.Compiled);
+
+
+
+[^\]]+면 []를 못 잡습니다. 반드시 *입니다.
+
+
+
+3. ParseFileAsync() 전체 교체
+
+
+private async Task ParseFileAsync(string file)
 {
-    string source = Path.GetFileName(file);
-
-    if (!kvIndexByFile.ContainsKey(source))
-        kvIndexByFile[source] = new Dictionary<int, Dictionary<string, Dictionary<int, string>>>();
-
-    if (!lotIndexByFile.ContainsKey(source))
-        lotIndexByFile[source] = new Dictionary<int, string>();
-
-    var fileMap = kvIndexByFile[source];
-    var lotMap = lotIndexByFile[source];
-
-    string[] lines;
-
-    // 운영 로그 파일이 다른 프로세스에서 쓰는 중이어도 읽을 수 있게 처리
-    using (var fs = new FileStream(
-        file,
-        FileMode.Open,
-        FileAccess.Read,
-        FileShare.ReadWrite | FileShare.Delete))
-    using (var sr = new StreamReader(fs, Encoding.UTF8, true))
+    using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+    using (var sr = new StreamReader(fs, Encoding.UTF8, true, 1024 * 64))
     {
-        var list = new List<string>();
-
         string line;
-        while ((line = sr.ReadLine()) != null)
+        long idx = 0;
+        var source = Path.GetFileName(file);
+
+        while ((line = await sr.ReadLineAsync()) != null)
         {
-            list.Add(line);
-        }
-
-        lines = list.ToArray();
-    }
-
-    for (int i = 0; i < lines.Length; i++)
-    {
-        string line = lines[i];
-
-        var hm = headRx.Match(line);
-        if (!hm.Success)
-            continue;
-
-        string rest = hm.Groups["rest"].Value;
-
-        string varName = GetVarFromHeader(source, rest);
-
-        if (string.IsNullOrWhiteSpace(varName) ||
-            !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
-        {
-            continue;
-        }
-
-        var pairs = new Dictionary<string, Dictionary<int, string>>(StringComparer.OrdinalIgnoreCase);
-
-        int j = i + 1;
-
-        while (j < lines.Length)
-        {
-            string bodyLine = lines[j];
-
-            // 다음 로그 헤더가 나오면 현재 블록 종료
-            if (headRx.IsMatch(bodyLine))
-                break;
-
-            var kv = Regex.Match(
-                bodyLine,
-                @"^\s*\[(?<idx>\d+)\s*:\s*(?<key>[^\]]+)\]\s*:\s*(?<val>.*)$",
-                RegexOptions.IgnoreCase);
-
-            if (kv.Success)
+            var m = headRx.Match(line);
+            if (!m.Success)
             {
-                int idx;
-                if (!int.TryParse(kv.Groups["idx"].Value, out idx))
-                    idx = 0;
-
-                string key = kv.Groups["key"].Value.Trim();
-                string val = kv.Groups["val"].Value.Trim();
-
-                if (!pairs.TryGetValue(key, out var byIndex))
-                {
-                    byIndex = new Dictionary<int, string>();
-                    pairs[key] = byIndex;
-                }
-
-                byIndex[idx] = val;
+                idx++;
+                continue;
             }
 
-            j++;
-        }
+            DateTime ts;
+            if (!DateTime.TryParse(m.Groups["dt"].Value, out ts))
+            {
+                idx++;
+                continue;
+            }
 
-        if (pairs.Count > 0)
-        {
-            fileMap[i] = pairs;
+            string level = m.Groups["level"].Value;
+            string rest = m.Groups["rest"].Value;
 
-            string lot = PickLotFromPairs(varName, pairs);
-            if (!string.IsNullOrWhiteSpace(lot))
-                lotMap[i] = lot;
+            var tokens = new List<string>();
+            string tmp = rest;
+            int guard = 0;
+
+            while (guard < 10)
+            {
+                var bm = bracketRx.Match(tmp);
+                if (!bm.Success)
+                    break;
+
+                tokens.Add((bm.Groups["tok"].Value ?? "").Trim());
+                tmp = tmp.Substring(bm.Length).TrimStart();
+
+                guard++;
+            }
+
+            string device = GetDeviceFromFileName(file);
+
+            string varName = PickVarFromTokens(tokens);
+
+            // [STEP_4][FAAdaptor]Execute Service : BR_XXX 같은 케이스 보정
+            if (string.IsNullOrWhiteSpace(varName))
+                varName = PickBrFromText(rest);
+
+            if (string.IsNullOrWhiteSpace(varName))
+                varName = device ?? "GLOBAL";
+
+            string step = PickStepFromTokens(tokens);
+            int stepNo = GetStepNo(step);
+
+            var kind = DetectKind(tmp);
+
+            // Fail - 사유처럼 전체 rest 안에 붙은 케이스 보조 감지
+            if (kind == ActionKind.Other)
+                kind = DetectKind(rest);
+
+            bool isOne =
+                (kind == ActionKind.Start) &&
+                !varName.StartsWith("BR_", StringComparison.OrdinalIgnoreCase);
+
+            lock (locker)
+            {
+                rows.Add(new LogRow
+                {
+                    Timestamp = ts,
+                    Level = level,
+                    Device = device,
+                    Var = varName,
+                    SourceFile = source,
+                    LineIndex = idx,
+                    IsOneLiner = isOne,
+                    Kind = kind,
+                    Var_ = rest,
+                    Step = step,
+                    StepNo = stepNo
+                });
+            }
+
+            idx++;
         }
     }
 }
 
 
 
-이 메서드로 바꾸면 해당 에러는 잡힙니다.
+
+4. GetVarFromHeader() 전체 교체
 
 
-The process cannot access the file because it is being used by another process.
+private string GetVarFromHeader(string sourceFile, string rest)
+{
+    var tokens = new List<string>();
+    string tmp = rest ?? "";
+    int guard = 0;
+
+    while (guard < 10)
+    {
+        var m = bracketRx.Match(tmp);
+        if (!m.Success)
+            break;
+
+        tokens.Add((m.Groups["tok"].Value ?? "").Trim());
+        tmp = tmp.Substring(m.Length).TrimStart();
+
+        guard++;
+    }
+
+    string varName = PickVarFromTokens(tokens);
+
+    if (!string.IsNullOrWhiteSpace(varName))
+        return varName;
+
+    varName = PickBrFromText(rest);
+
+    if (!string.IsNullOrWhiteSpace(varName))
+        return varName;
+
+    var device = GetDeviceFromFileName(sourceFile);
+    return device ?? "GLOBAL";
+}
 
 
 
-원인은 File.ReadAllLines()가 아니라, 운영 로그 파일을 다른 프로세스가 쓰는 중인데 공유 옵션 없이 읽으려고 해서 발생한 겁니다.
+
+5. DetectKind() 전체 교체
+
+
+private ActionKind DetectKind(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return ActionKind.Other;
+
+    text = text.Trim();
+
+    // NG는 명시적인 Fail / ACK=NG일 때만
+    if (Regex.IsMatch(text, @"\bFail\b", RegexOptions.IgnoreCase))
+        return ActionKind.Fail;
+
+    if (Regex.IsMatch(text, @"ACK\s*=\s*NG", RegexOptions.IgnoreCase))
+        return ActionKind.Fail;
+
+    // Start / Success / End는 앞쪽 기준만 허용
+    // JOB_START, Request Start Time 같은 오탐 방지
+    if (text.StartsWith("Success", StringComparison.OrdinalIgnoreCase))
+        return ActionKind.Success;
+
+    if (text.StartsWith("End", StringComparison.OrdinalIgnoreCase))
+        return ActionKind.End;
+
+    if (text.StartsWith("Start", StringComparison.OrdinalIgnoreCase))
+        return ActionKind.Start;
+
+    return ActionKind.Other;
+}
+
+
+
+
+6. BuildMergedQueue() 전체 교체
+
+
+private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
+{
+    var result = new List<CombinedRow>();
+
+    // BR별 FIFO 큐
+    var queues = new Dictionary<string, Queue<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
+
+    // Fail로 닫힌 직후 들어오는 End를 무시하기 위한 플래그
+    var ignoreNextEndAfterFail = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var r in ordered)
+    {
+        if (string.IsNullOrEmpty(r.Var) ||
+            !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
+        {
+            continue;
+        }
+
+        Queue<CombinedRow> q;
+        if (!queues.TryGetValue(r.Var, out q))
+        {
+            q = new Queue<CombinedRow>();
+            queues[r.Var] = q;
+        }
+
+        if (r.Kind == ActionKind.Start)
+        {
+            // 새 Start가 왔으므로 후속 End 무시 플래그 해제
+            ignoreNextEndAfterFail.Remove(r.Var);
+
+            // Start → Success → Start
+            // 이전 건이 Success까지 찍혔는데 End가 없으면 이전 건을 Success로 확정
+            while (q.Count > 0 && q.Peek().Status == "Success")
+            {
+                var done = q.Dequeue();
+
+                if (!done.EndTs.HasValue)
+                {
+                    done.EndTs = done.SuccessTs ?? done.StartTs;
+                    done.EndIdx = done.SuccessIdx >= 0 ? done.SuccessIdx : done.StartIdx;
+                }
+
+                done.Status = "Success";
+                done.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((done.EndTs.Value - done.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(done);
+                result.Add(done);
+            }
+
+            // Start → End → Start
+            // 이전 건이 End까지만 있고 Success/Fail이 없으면 Unknown으로 확정
+            while (q.Count > 0 &&
+                   q.Peek().Status == "Unknown" &&
+                   q.Peek().EndTs.HasValue)
+            {
+                var unknown = q.Dequeue();
+
+                unknown.SuccessTs = unknown.EndTs;
+                unknown.SuccessIdx = unknown.EndIdx >= 0 ? unknown.EndIdx : unknown.StartIdx;
+                unknown.Status = "Unknown";
+                unknown.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((unknown.EndTs.Value - unknown.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(unknown);
+                result.Add(unknown);
+            }
+
+            q.Enqueue(new CombinedRow
+            {
+                Var = r.Var,
+                StartTs = r.Timestamp,
+                Status = "Unknown",
+                SourceFile = r.SourceFile,
+                StartIdx = (int)r.LineIndex,
+                EndIdx = -1,
+                SuccessIdx = -1,
+                MLot = ""
+            });
+        }
+        else if (r.Kind == ActionKind.Success)
+        {
+            ignoreNextEndAfterFail.Remove(r.Var);
+
+            if (q.Count > 0)
+            {
+                // FIFO 기준: 가장 먼저 열린 Start에 Success 매칭
+                var cur = q.Peek();
+
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.Status = "Success";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(cur);
+
+                // 여기서 result.Add 하지 않음.
+                // End가 오면 End에서 닫고,
+                // End 없이 다음 Start가 오면 Start에서 Success로 닫음.
+            }
+            else
+            {
+                // Success 단독
+                var row = new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "Success",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0,
+                    MLot = ""
+                };
+
+                FillLotByIndex(row);
+                result.Add(row);
+            }
+        }
+        else if (r.Kind == ActionKind.End)
+        {
+            if (ignoreNextEndAfterFail.Contains(r.Var))
+            {
+                // Start → Fail → End
+                // Fail에서 이미 NG로 닫혔으므로 뒤 End는 무시
+                ignoreNextEndAfterFail.Remove(r.Var);
+                continue;
+            }
+
+            if (q.Count > 0)
+            {
+                var cur = q.Peek();
+
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                if (cur.Status == "Success")
+                {
+                    // Start → Success → End
+                    q.Dequeue();
+
+                    // SuccessIdx는 Success 라인 유지
+                    FillLotByIndex(cur);
+                    result.Add(cur);
+                }
+                else
+                {
+                    // Start → End
+                    // 여기서 바로 Add하지 않음.
+                    // 뒤에 Fail이 올 수 있으므로 큐에 남겨둠.
+                    // 다음 Start 또는 파일 끝에서 Unknown 처리.
+                }
+            }
+            else
+            {
+                // End 단독은 표시하지 않음.
+                // 독립 Unknown으로 만들면 호출 1건이 2건처럼 보일 수 있음.
+                continue;
+            }
+        }
+        else if (r.Kind == ActionKind.Fail)
+        {
+            if (q.Count > 0)
+            {
+                // Start → Fail
+                // NG는 Fail이 있을 때만 부여
+                var cur = q.Dequeue();
+
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.Status = "NG";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(cur);
+                result.Add(cur);
+
+                // 바로 뒤 같은 BR End가 오면 후속 End로 보고 무시
+                ignoreNextEndAfterFail.Add(r.Var);
+            }
+            else
+            {
+                // Fail 단독
+                var row = new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "NG",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0,
+                    MLot = ""
+                };
+
+                FillLotByIndex(row);
+                result.Add(row);
+
+                // Fail 단독 뒤 End가 따라오는 경우도 무시
+                ignoreNextEndAfterFail.Add(r.Var);
+            }
+        }
+        else
+        {
+            // [BR_...] 단독, STEP 로그, FAAdaptor 로그 등
+            // 판정은 하지 않고 열린 큐가 있으면 상세 범위만 확장
+            if (q.Count > 0)
+            {
+                var cur = q.Peek();
+
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+            }
+            else
+            {
+                // 열린 큐가 없는 STEP/BR 단독 로그는 결과 Row로 만들지 않음.
+                // 원본 로그에는 남아 있으므로 상세/원본에서는 확인 가능.
+                continue;
+            }
+        }
+    }
+
+    // 파일 끝까지 남은 큐 처리
+    foreach (var kv in queues)
+    {
+        var q = kv.Value;
+
+        while (q.Count > 0)
+        {
+            var cur = q.Dequeue();
+
+            if (cur.Status == "Success")
+            {
+                // Start → Success까지만 있고 End가 없어도 Success 유지
+                if (!cur.EndTs.HasValue)
+                {
+                    cur.EndTs = cur.SuccessTs ?? cur.StartTs;
+                    cur.EndIdx = cur.SuccessIdx >= 0 ? cur.SuccessIdx : cur.StartIdx;
+                }
+
+                cur.Status = "Success";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(cur);
+                result.Add(cur);
+            }
+            else
+            {
+                // Success도 Fail도 없는 Start 잔여 건은 Unknown
+                if (!cur.EndTs.HasValue)
+                {
+                    cur.EndTs = cur.StartTs;
+                    cur.EndIdx = cur.StartIdx;
+                }
+
+                cur.SuccessTs = cur.EndTs;
+                cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
+                cur.Status = "Unknown";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(cur);
+                result.Add(cur);
+            }
+        }
+    }
+
+    return result
+        .OrderBy(x => x.StartTs)
+        .ThenBy(x => x.StartIdx)
+        .ToList();
+}
+
+
+
+
+7. 헬퍼 메서드 추가
+
+
+이미 같은 기능이 있으면 중복 추가하지 말고 교체하세요.
+
+
+private string PickVarFromTokens(List<string> tokens)
+{
+    if (tokens == null || tokens.Count == 0)
+        return null;
+
+    // 1순위: BR_ 토큰
+    var br = tokens.FirstOrDefault(t =>
+        !string.IsNullOrWhiteSpace(t) &&
+        t.Trim().StartsWith("BR_", StringComparison.OrdinalIgnoreCase));
+
+    if (!string.IsNullOrWhiteSpace(br))
+        return br.Trim();
+
+    // 2순위: 빈값, STEP_, 로그레벨 제외 후 마지막 유효 토큰
+    var valid = tokens
+        .Select(t => (t ?? "").Trim())
+        .Where(t => !string.IsNullOrWhiteSpace(t))
+        .Where(t => !t.StartsWith("STEP_", StringComparison.OrdinalIgnoreCase))
+        .Where(t => !IsLogLevel(t))
+        .ToList();
+
+    if (valid.Count > 0)
+        return valid.Last();
+
+    return null;
+}
+
+private string PickBrFromText(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return null;
+
+    var m = Regex.Match(text, @"\bBR_[A-Za-z0-9_]+\b", RegexOptions.IgnoreCase);
+    if (!m.Success)
+        return null;
+
+    return m.Value.Trim();
+}
+
+private string PickStepFromTokens(List<string> tokens)
+{
+    if (tokens == null || tokens.Count == 0)
+        return null;
+
+    return tokens.FirstOrDefault(t =>
+        !string.IsNullOrWhiteSpace(t) &&
+        Regex.IsMatch(t.Trim(), @"^STEP_\d+$", RegexOptions.IgnoreCase));
+}
+
+private int GetStepNo(string step)
+{
+    if (string.IsNullOrWhiteSpace(step))
+        return -1;
+
+    var m = Regex.Match(step.Trim(), @"^STEP_(?<no>\d+)$", RegexOptions.IgnoreCase);
+    if (!m.Success)
+        return -1;
+
+    int no;
+    if (!int.TryParse(m.Groups["no"].Value, out no))
+        return -1;
+
+    return no;
+}
+
+private string GetDeviceFromFileName(string file)
+{
+    var n = Path.GetFileNameWithoutExtension(file);
+    var cut = n.LastIndexOf('_');
+
+    return cut > 0 ? n.Substring(0, cut) : n;
+}
+
+private bool IsLogLevel(string token)
+{
+    if (string.IsNullOrWhiteSpace(token))
+        return false;
+
+    return token.Equals("info", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("warn", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("warning", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("error", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("debug", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("trace", StringComparison.OrdinalIgnoreCase)
+        || token.Equals("verbose", StringComparison.OrdinalIgnoreCase);
+}
+
+private void FillLotByIndex(CombinedRow row)
+{
+    if (row == null)
+        return;
+
+    if (!string.IsNullOrEmpty(row.MLot))
+        return;
+
+    if (row.SuccessIdx < 0)
+        return;
+
+    if (kvIndexByFile.TryGetValue(row.SourceFile, out var fileMap) &&
+        fileMap.TryGetValue(row.SuccessIdx, out var pairs))
+    {
+        row.MLot = PickLotFromPairs(row.Var, pairs);
+    }
+}
+
+
+
+
+이 코드의 최종 처리 기준
+
+
+Start → Success → Start
+= 첫 번째 건 Success 종료 후 새 Start 시작
+
+Start → Success → End
+= Success
+
+Start → Success
+= Success 유지
+
+Start → End
+= Unknown
+
+Start → Fail
+= NG
+
+Start → Fail → End
+= NG 1건, 뒤 End 무시
+
+Fail 단독
+= NG
+
+Success 단독
+= Success
+
+End 단독
+= 무시
+
+[STEP_x][BR_...] 또는 [STEP_4][FAAdaptor]Execute Service : BR_...
+= 열린 큐가 있으면 상세 범위만 확장
+= 결과 판정에는 사용하지 않음
+
+
+
+이 버전은 Success를 End 없다고 삭제하지 않고, NG는 Fail일 때만 부여하고, End 단독은 결과 Row로 만들지 않습니다.
 
