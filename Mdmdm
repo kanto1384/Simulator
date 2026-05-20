@@ -1,292 +1,373 @@
-지금 화면 기준으로 보면 발생 횟수 29건은 맞는데, 상세 범위가 잘못 끊긴 상태입니다.
+맞습니다. 소스는 처음 상태로 되돌리는 게 맞습니다.
+
+그리고 처음 상태에서 BuildMergedQueue()만 제대로 다시 짜야 합니다.
 
 
-원인은 이겁니다.
+이번 문제의 핵심은 이겁니다.
 
 
-Start
-Start
-Success
-[IN_EQP]
-[0:EQPTID] ...
-[0:OUT_LOTID] ...
-...
-다음 Start
+Start Start Success Success
 
 
 
-현재 BuildMergedQueue()는 EndIdx = Success 라인까지만 잡고 있습니다.
+이 패턴에서 Success가 들어왔을 때 q.Peek()만 하고 큐를 안 넘기면, Success가 계속 첫 번째 Start에 덮입니다.
 
-그런데 실제 중요한 JSON/KV 데이터는 Success 라인 뒤에 붙어 있습니다.
-
-
-그래서 결합 수량은 맞는데, 상세보기에서 중요한 로그가 안 보이는 겁니다.
+그래서 END - START 시간이 몇천 초로 튑니다.
 
 
-즉, 지금 고칠 곳은 BuildMergedQueue()보다 상세보기 범위 계산 로직입니다.
+이번 기준은 이렇게 잡겠습니다.
 
 
+Start → 큐에 적재
 
-1. 클래스 필드 추가
+Success → 큐 맨 앞 Start를 즉시 Success로 종료
+          단, 바로 뒤 End가 오면 같은 Row의 End 시간만 보정
 
+End → 직전 Success Row가 있으면 그 Row의 End 시간 보정
+      열린 Start만 있으면 End 시간만 저장하고 보류
+      단독 End는 무시
 
-MainForm 클래스 필드 쪽에 추가하세요.
+Start → 새 Start가 들어왔을 때, 이전 Start+End만 남아 있으면 Unknown 확정
 
+Fail → 열린 Start가 있을 때만 NG
+       Fail 단독은 무시
 
-private readonly Dictionary<string, string> sourcePathByFileName =
-    new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-
-
-
-2. ParseFileAsync() 안에 파일 경로 저장 추가
-
-
-ParseFileAsync() 안에 이 부분이 있을 겁니다.
-
-
-var source = Path.GetFileName(file);
+파일 끝 → 남은 Start는 Unknown
 
 
 
-바로 아래에 추가하세요.
+즉, Success는 들어오는 순간 FIFO로 하나씩 빼야 합니다.
+
+이게 핵심입니다.
 
 
-lock (locker)
+
+BuildMergedQueue() 전체 교체
+
+
+private List<CombinedRow> BuildMergedQueue(IEnumerable<LogRow> ordered)
 {
-    sourcePathByFileName[source] = file;
-}
+    var result = new List<CombinedRow>();
 
+    // BR별 열린 Start FIFO
+    var queues = new Dictionary<string, Queue<CombinedRow>>(StringComparer.OrdinalIgnoreCase);
 
+    // Success 직후 End가 오는 케이스 보정용
+    // Start → Success → End 에서 End 시간만 같은 Row에 반영
+    var pendingSuccessByVar = new Dictionary<string, CombinedRow>(StringComparer.OrdinalIgnoreCase);
 
-또는 이미 lock (locker)가 아래쪽에 있으면, 그 안에 같이 넣어도 됩니다.
-
-
-
-3. 공유 읽기 메서드 추가
-
-
-운영 로그 파일이 열려 있어도 읽을 수 있게 합니다.
-
-
-private string[] ReadAllLinesShared(string file)
-{
-    var list = new List<string>();
-
-    using (var fs = new FileStream(
-        file,
-        FileMode.Open,
-        FileAccess.Read,
-        FileShare.ReadWrite | FileShare.Delete))
-    using (var sr = new StreamReader(fs, Encoding.UTF8, true))
+    foreach (var r in ordered)
     {
-        string line;
-        while ((line = sr.ReadLine()) != null)
+        if (string.IsNullOrEmpty(r.Var) ||
+            !r.Var.StartsWith("BR_", StringComparison.OrdinalIgnoreCase))
         {
-            list.Add(line);
+            continue;
+        }
+
+        Queue<CombinedRow> q;
+        if (!queues.TryGetValue(r.Var, out q))
+        {
+            q = new Queue<CombinedRow>();
+            queues[r.Var] = q;
+        }
+
+        if (r.Kind == ActionKind.Start)
+        {
+            // 새 Start가 왔으므로 이전 Success는 더 이상 End 보정 대상 아님
+            if (pendingSuccessByVar.ContainsKey(r.Var))
+                pendingSuccessByVar.Remove(r.Var);
+
+            // 이전 Start + End만 있고 Success/Fail이 없던 건은 Unknown으로 확정
+            while (q.Count > 0 &&
+                   q.Peek().Status == "Unknown" &&
+                   q.Peek().EndTs.HasValue)
+            {
+                var unknown = q.Dequeue();
+
+                unknown.SuccessTs = unknown.EndTs;
+                unknown.SuccessIdx = unknown.EndIdx >= 0 ? unknown.EndIdx : unknown.StartIdx;
+                unknown.Status = "Unknown";
+                unknown.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((unknown.EndTs.Value - unknown.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(unknown);
+                result.Add(unknown);
+            }
+
+            // 새 Start 적재
+            q.Enqueue(new CombinedRow
+            {
+                Var = r.Var,
+                StartTs = r.Timestamp,
+                Status = "Unknown",
+                SourceFile = r.SourceFile,
+                StartIdx = (int)r.LineIndex,
+                EndIdx = -1,
+                SuccessIdx = -1,
+                MLot = ""
+            });
+        }
+        else if (r.Kind == ActionKind.Success)
+        {
+            // 다른 Success가 왔으므로 이전 Success는 End 보정 종료
+            if (pendingSuccessByVar.ContainsKey(r.Var))
+                pendingSuccessByVar.Remove(r.Var);
+
+            if (q.Count > 0)
+            {
+                // 핵심:
+                // Success는 FIFO 기준으로 맨 앞 Start를 즉시 종료한다.
+                // Start Start Success Success 구조에서 시간이 길어지는 문제 방지.
+                var cur = q.Dequeue();
+
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.Status = "Success";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(cur);
+                result.Add(cur);
+
+                // 바로 뒤 End가 오면 이 Row의 End 시간만 보정
+                pendingSuccessByVar[r.Var] = cur;
+            }
+            else
+            {
+                // Success 단독도 실제 성공 로그이므로 표시
+                var row = new CombinedRow
+                {
+                    Var = r.Var,
+                    StartTs = r.Timestamp,
+                    SuccessTs = r.Timestamp,
+                    EndTs = r.Timestamp,
+                    Status = "Success",
+                    SourceFile = r.SourceFile,
+                    StartIdx = (int)r.LineIndex,
+                    EndIdx = (int)r.LineIndex,
+                    SuccessIdx = (int)r.LineIndex,
+                    DurationSeconds = 0,
+                    MLot = ""
+                };
+
+                FillLotByIndex(row);
+                result.Add(row);
+
+                pendingSuccessByVar[r.Var] = row;
+            }
+        }
+        else if (r.Kind == ActionKind.End)
+        {
+            // Start → Success → End
+            // Success Row가 이미 만들어져 있으면 End 시간만 보정한다.
+            CombinedRow successRow;
+            if (pendingSuccessByVar.TryGetValue(r.Var, out successRow))
+            {
+                successRow.EndTs = r.Timestamp;
+                successRow.EndIdx = (int)r.LineIndex;
+                successRow.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((successRow.EndTs.Value - successRow.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(successRow);
+                pendingSuccessByVar.Remove(r.Var);
+                continue;
+            }
+
+            if (q.Count > 0)
+            {
+                // Start → End
+                // 여기서 바로 Unknown으로 Add하지 않음.
+                // 뒤에 Fail이 올 수 있으므로 End 시간만 저장.
+                var cur = q.Peek();
+
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+            }
+            else
+            {
+                // End 단독은 무시
+                // 호출 1건이 2건처럼 보이는 문제 방지
+                continue;
+            }
+        }
+        else if (r.Kind == ActionKind.Fail)
+        {
+            if (pendingSuccessByVar.ContainsKey(r.Var))
+                pendingSuccessByVar.Remove(r.Var);
+
+            if (q.Count > 0)
+            {
+                // Start → Fail
+                // NG는 열린 Start가 있을 때만 부여
+                var cur = q.Dequeue();
+
+                cur.SuccessTs = r.Timestamp;
+                cur.SuccessIdx = (int)r.LineIndex;   // JSON / LOT 기준 인덱스
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.Status = "NG";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+
+                FillLotByIndex(cur);
+                result.Add(cur);
+            }
+            else
+            {
+                // Fail 단독은 무시
+                // 앞뒤 문맥 없는 Fail을 NG 1건으로 만들면 호출 수가 부풀 수 있음
+                continue;
+            }
+        }
+        else
+        {
+            // BR 단독 / STEP / 기타 로그
+            // 판정하지 않고 열린 큐의 상세 범위만 확장
+            if (q.Count > 0)
+            {
+                var cur = q.Peek();
+
+                cur.EndTs = r.Timestamp;
+                cur.EndIdx = (int)r.LineIndex;
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+            }
+
+            // 열린 큐가 없으면 결과 Row 생성하지 않음
+            continue;
         }
     }
 
-    return list.ToArray();
+    // 파일 끝까지 남은 Start 처리
+    foreach (var kv in queues)
+    {
+        var q = kv.Value;
+
+        while (q.Count > 0)
+        {
+            var cur = q.Dequeue();
+
+            if (cur.EndTs.HasValue)
+            {
+                // Start + End만 있고 Success/Fail 없음
+                cur.SuccessTs = cur.EndTs;
+                cur.SuccessIdx = cur.EndIdx >= 0 ? cur.EndIdx : cur.StartIdx;
+                cur.Status = "Unknown";
+                cur.DurationSeconds = Math.Max(
+                    0,
+                    Math.Round((cur.EndTs.Value - cur.StartTs).TotalSeconds, 3)
+                );
+            }
+            else
+            {
+                // Start만 남음
+                cur.EndTs = cur.StartTs;
+                cur.EndIdx = cur.StartIdx;
+                cur.SuccessTs = cur.StartTs;
+                cur.SuccessIdx = cur.StartIdx;
+                cur.Status = "Unknown";
+                cur.DurationSeconds = 0;
+            }
+
+            FillLotByIndex(cur);
+            result.Add(cur);
+        }
+    }
+
+    return result
+        .OrderBy(x => x.StartTs)
+        .ThenBy(x => x.StartIdx)
+        .ToList();
 }
 
 
 
 
-4. 상세 끝 라인 보정 메서드 추가
+FillLotByIndex() 없으면 추가
 
 
-핵심입니다.
-
-Success, Fail, End 뒤에 붙은 [IN_EQP], [0:LOTID] 같은 데이터 블록까지 포함합니다.
+이미 있으면 중복 추가하지 마세요.
 
 
-private int GetPhysicalDetailEndIdx(CombinedRow row)
+private void FillLotByIndex(CombinedRow row)
 {
     if (row == null)
-        return -1;
+        return;
 
-    int baseEndIdx = Math.Max(row.StartIdx, row.EndIdx);
+    if (!string.IsNullOrEmpty(row.MLot))
+        return;
 
-    if (row.SuccessIdx >= 0)
-        baseEndIdx = Math.Max(baseEndIdx, row.SuccessIdx);
+    if (row.SuccessIdx < 0)
+        return;
 
-    if (baseEndIdx < 0)
-        return row.StartIdx;
+    Dictionary<int, Dictionary<string, Dictionary<int, string>>> fileMap;
+    Dictionary<string, Dictionary<int, string>> pairs;
 
-    if (!sourcePathByFileName.TryGetValue(row.SourceFile, out var file))
-        return baseEndIdx;
-
-    if (string.IsNullOrWhiteSpace(file) || !File.Exists(file))
-        return baseEndIdx;
-
-    string[] lines;
-
-    try
+    if (kvIndexByFile.TryGetValue(row.SourceFile, out fileMap) &&
+        fileMap.TryGetValue(row.SuccessIdx, out pairs))
     {
-        lines = ReadAllLinesShared(file);
+        row.MLot = PickLotFromPairs(row.Var, pairs);
     }
-    catch
-    {
-        return baseEndIdx;
-    }
-
-    if (baseEndIdx >= lines.Length)
-        return lines.Length - 1;
-
-    int endIdx = baseEndIdx;
-
-    for (int i = baseEndIdx + 1; i < lines.Length; i++)
-    {
-        string line = lines[i];
-
-        // 다음 로그 헤더가 나오면 현재 상세 블록 종료
-        if (headRx.IsMatch(line))
-            break;
-
-        // Success/Fail/End 뒤에 붙는 JSON/KV 본문은 포함
-        endIdx = i;
-    }
-
-    return endIdx;
 }
 
 
 
 
-5. 상세 텍스트 생성 메서드 추가
+이 버전의 처리 결과
 
 
-private string BuildDetailText(CombinedRow row)
-{
-    if (row == null)
-        return string.Empty;
+Start → Success
+= Success
 
-    if (!sourcePathByFileName.TryGetValue(row.SourceFile, out var file))
-        return string.Empty;
+Start → Success → End
+= Success, End 시간 보정
 
-    if (string.IsNullOrWhiteSpace(file) || !File.Exists(file))
-        return string.Empty;
+Start → Success → Start
+= 첫 번째 Success 확정 후 새 Start
 
-    string[] lines = ReadAllLinesShared(file);
+Start → Start → Success → Success
+= 첫 번째 Start + 첫 번째 Success
+= 두 번째 Start + 두 번째 Success
 
-    int startIdx = row.StartIdx;
-    int endIdx = GetPhysicalDetailEndIdx(row);
+Start → End
+= Unknown
 
-    if (startIdx < 0)
-        startIdx = 0;
+Start → Fail
+= NG
 
-    if (endIdx < startIdx)
-        endIdx = startIdx;
+Start → Fail → End
+= NG 1건, End 단독은 무시
 
-    if (startIdx >= lines.Length)
-        return string.Empty;
+Fail 단독
+= 무시
 
-    if (endIdx >= lines.Length)
-        endIdx = lines.Length - 1;
+End 단독
+= 무시
 
-    var sb = new StringBuilder();
 
-    for (int i = startIdx; i <= endIdx; i++)
-    {
-        sb.AppendLine(lines[i]);
-    }
 
-    return sb.ToString();
-}
+핵심은 이 줄입니다.
 
 
+var cur = q.Dequeue();
 
 
-6. 상세창 열 때 기존 상세 생성부 교체
 
-
-기존에 상세창에서 이런 식으로 하고 있을 겁니다.
-
-
-var list = rows.Where(r =>
-    r.SourceFile == row.SourceFile &&
-    r.LineIndex >= row.StartIdx &&
-    r.LineIndex <= row.EndIdx)
-    .OrderBy(r => r.LineIndex)
-    .ToList();
-
-
-
-또는 StartIdx ~ EndIdx 기준으로 텍스트를 만들고 있을 겁니다.
-
-
-그 부분을 아래처럼 바꾸세요.
-
-
-string detailText = BuildDetailText(row);
-txtDetail.Text = detailText;
-
-
-
-txtDetail 이름이 다르면, 상세창에서 실제 텍스트박스 이름에 맞춰 넣으면 됩니다.
-
-
-예:
-
-
-detailForm.TextBox.Text = BuildDetailText(row);
-
-
-
-
-왜 이게 맞냐면
-
-
-현재 로그는 이렇게 되어 있습니다.
-
-
-08:11:55.737 [BR...] Start
-08:11:55.738 [BR...] Start
-08:11:55.792 [BR...] Success
-
-[IN_EQP]
-[0:EQPTID] : ...
-[0:OUT_LOTID] : ...
-...
-
-
-
-즉, Success 라인까지만 상세를 자르면 안 됩니다.
-
-
-상세 범위는 이렇게 잡아야 합니다.
-
-
-StartIdx부터
-Success/Fail/End 라인 이후의 본문 데이터까지
-다음 timestamp 로그 헤더 직전까지
-
-
-
-그래야 OUT_LOTID, INPUT_LOTID, START_POSITION, END_POSITION 같은 중요한 데이터가 안 빠집니다.
-
-
-
-결론
-
-
-지금은 결합 알고리즘보다 상세 보기 범위가 짧게 잘리는 게 문제입니다.
-
-
-수정 방향:
-
-
-BuildMergedQueue는 지금 기준 유지
-Success는 End 없어도 유지
-NG는 Fail 있을 때만
-End 단독은 무시
-
-추가로:
-상세보기는 EndIdx에서 바로 끊지 말고
-다음 로그 헤더 전까지 원본 파일 라인을 포함
-
-
-
-이렇게 하면 29건 발생 수는 유지하면서, 각 건의 실제 JSON/KV 본문도 다시 보일 가능성이 큽니다.
+Success에서 q.Peek()이 아니라 q.Dequeue()로 즉시 하나씩 닫아야 Start 100건과 Success 100건이 FIFO로 정상 매칭됩니다.
 
